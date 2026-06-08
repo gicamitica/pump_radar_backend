@@ -14626,6 +14626,90 @@ async def get_coin_live_market(network: str, address: str, symbol: str = ""):
     except Exception as e:
         return api_ok({"live": False, "error": str(e)})
 
+
+_cex_price_cache: Dict[str, tuple] = {}
+
+@app.get("/api/crypto/cex-prices/{symbol}")
+async def get_cex_prices(symbol: str):
+    """Pret real de pe Binance + Coinbase pentru un simbol (cache 10s). null daca nu e listat."""
+    import time as _t
+    import httpx as _httpx
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return api_ok({"binance": None, "coinbase": None})
+    cached = _cex_price_cache.get(sym)
+    if cached and (_t.time() - cached[0]) < 10:
+        return api_ok(cached[1])
+    binance_price = None
+    coinbase_price = None
+    try:
+        async with _httpx.AsyncClient(timeout=8) as client:
+            # Binance
+            try:
+                r = await client.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": f"{sym}USDT"})
+                if r.status_code == 200:
+                    p = (r.json() or {}).get("price")
+                    if p is not None:
+                        binance_price = float(p)
+            except Exception:
+                pass
+            # Coinbase
+            try:
+                r = await client.get(f"https://api.coinbase.com/v2/prices/{sym}-USD/spot")
+                if r.status_code == 200:
+                    p = (((r.json() or {}).get("data") or {}).get("amount"))
+                    if p is not None:
+                        coinbase_price = float(p)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    payload = {"binance": binance_price, "coinbase": coinbase_price}
+    _cex_price_cache[sym] = (_t.time(), payload)
+    return api_ok(payload)
+
+
+_cex_price_cache: Dict[str, tuple] = {}
+
+@app.get("/api/crypto/cex-prices/{symbol}")
+async def get_cex_prices(symbol: str):
+    """Pret real de pe Binance + Coinbase pentru un simbol (cache 10s). null daca nu e listat."""
+    import time as _t
+    import httpx as _httpx
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return api_ok({"binance": None, "coinbase": None})
+    cached = _cex_price_cache.get(sym)
+    if cached and (_t.time() - cached[0]) < 10:
+        return api_ok(cached[1])
+    binance_price = None
+    coinbase_price = None
+    try:
+        async with _httpx.AsyncClient(timeout=8) as client:
+            # Binance
+            try:
+                r = await client.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": f"{sym}USDT"})
+                if r.status_code == 200:
+                    p = (r.json() or {}).get("price")
+                    if p is not None:
+                        binance_price = float(p)
+            except Exception:
+                pass
+            # Coinbase
+            try:
+                r = await client.get(f"https://api.coinbase.com/v2/prices/{sym}-USD/spot")
+                if r.status_code == 200:
+                    p = (((r.json() or {}).get("data") or {}).get("amount"))
+                    if p is not None:
+                        coinbase_price = float(p)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    payload = {"binance": binance_price, "coinbase": coinbase_price}
+    _cex_price_cache[sym] = (_t.time(), payload)
+    return api_ok(payload)
+
 @app.post("/api/admin/trigger-scan-v2")
 async def trigger_scan_v2(request: Request):
     """Trigger scan nou arhitectura v2 - localhost only"""
