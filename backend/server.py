@@ -7516,7 +7516,7 @@ async def startup_event():
         await asyncio.sleep(30)  # Wait 30s before first fetch
         await run_full_scan(db)
     
-    # asyncio.create_task(delayed_fetch())  # disabled - scan starts via scheduler
+    asyncio.create_task(delayed_fetch())  # re-enabled: first scan ~30s after startup
 
     # Pre-load Qwen cache from MongoDB on startup
     async def preload_qwen_cache():
@@ -14587,6 +14587,44 @@ async def health():
 # NEW ARCHITECTURE v2 - PumpRadar Schema 2026
 # ─────────────────────────────────────────────
 from snapshot import run_full_scan, get_latest_snapshot
+from enricher import fetch_geckoterminal_by_address as _gt_by_address
+
+_coin_live_cache: Dict[str, tuple] = {}
+
+@app.get("/api/crypto/coin-live/{network}/{address}")
+async def get_coin_live_market(network: str, address: str, symbol: str = ""):
+    """Date LIVE de piata din GeckoTerminal pentru pagina coin-ului (cu cache 10s per token)."""
+    import time as _t
+    import httpx as _httpx
+    cache_key = f"{network}:{address}"
+    cached = _coin_live_cache.get(cache_key)
+    if cached and (_t.time() - cached[0]) < 10:
+        return api_ok(cached[1])
+    try:
+        async with _httpx.AsyncClient(follow_redirects=True) as client:
+            market = await _gt_by_address(client, network, address, symbol or address)
+        if not market:
+            payload = {"live": False}
+            _coin_live_cache[cache_key] = (_t.time(), payload)
+            return api_ok(payload)
+        pc = market.get("price_change_pct") or {}
+        vol = market.get("volume_usd") or {}
+        tx = market.get("transactions") or {}
+        payload = {
+            "live": True,
+            "price_usd": market.get("price_usd"),
+            "price_change_h1": pc.get("h1"),
+            "price_change_h6": pc.get("h6"),
+            "price_change_h24": pc.get("h24"),
+            "volume_h24": vol.get("h24"),
+            "reserve_usd": market.get("reserve_usd"),
+            "buy_sell_ratio_h1": tx.get("h1_buy_sell_ratio"),
+            "pool_url": market.get("pool_url"),
+        }
+        _coin_live_cache[cache_key] = (_t.time(), payload)
+        return api_ok(payload)
+    except Exception as e:
+        return api_ok({"live": False, "error": str(e)})
 
 @app.post("/api/admin/trigger-scan-v2")
 async def trigger_scan_v2(request: Request):

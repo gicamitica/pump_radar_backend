@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Dict, List, Optional
 
 import httpx
@@ -59,6 +60,7 @@ Decision logic:
 10. PRE-PUMP ACTIVITY (Sapienza): volume_h1 > (volume_h24/24)*3 AND price_change_h24 < 2 = insider movement before announcement, set pre_pump_activity=true, upgrade early confidence +15
 11. MANIPULATION SIGNAL (Bayi-Hu): telegram in sources AND mentions >= 3 = coordinated pump group activity, set manipulation_probability > 70, treat as high-confidence early or pump
 12. VOLUME ANOMALY (binancePump): buy_sell_ratio_h1 > 2.0 AND volume_h1 > 0 = confirmed real buying anomaly, upgrade confidence +10
+13. WHALE STRENGTH: use whale_score (0-100), whale_unique_buyers and whale_large_moves to gauge conviction. whale_score >= 70 with many unique_buyers (>= 5) = strong conviction, boost confidence. whale_score < 30 or unique_buyers <= 1 = weak whale signal, do not over-rely on accumulation flag. More unique_buyers than unique_sellers = healthy accumulation; reverse = distribution risk.
 
 Be balanced — not overly conservative. A token with good momentum and multi-source confirmation SHOULD be pump.
 A token with only Reddit/CT mention and no volume = watch.
@@ -91,6 +93,9 @@ def _build_candidate_summary(candidate: Dict) -> Dict:
         "whale_accumulation": whale.get("accumulation_detected", False),
         "whale_dump_risk": whale.get("dump_risk", False),
         "whale_score": whale.get("whale_score", 0),
+        "whale_large_moves": whale.get("large_moves", 0),
+        "whale_unique_buyers": whale.get("unique_buyers", 0),
+        "whale_unique_sellers": whale.get("unique_sellers", 0),
         "is_rekt": defi_rekt.get("is_rekt", False),
         "buy_tax": security.get("buy_tax"),
         "sell_tax": security.get("sell_tax"),
@@ -158,32 +163,55 @@ Respond ONLY with raw JSON, no markdown."""
 
 
 async def call_qwen_fallback(candidates_data: List[Dict]) -> Optional[Dict]:
-    try:
-        prompt = (
-            f"Classify these crypto tokens as pump/dump/risk/watch/early/dex/avoid. "
-            f"Return JSON with classifications array. Tokens: "
-            f"{json.dumps([c['symbol'] for c in candidates_data])}"
-        )
-        async with httpx.AsyncClient(timeout=35) as client:
-            resp = await client.post(
-                QWEN_URL,
-                json={
-                    "model": "local-qwen",
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens": 500,
-                },
+    # Qwen e model mic (context 2048) -- prompt scurt, fara SYSTEM_PROMPT greu.
+    # Procesam in sub-batch-uri de 5 ca sa nu depasim contextul.
+    cats = "pump/dump/risk/watch/early/dex/avoid"
+    all_clf = []
+    for i in range(0, len(candidates_data), 5):
+        chunk = candidates_data[i:i + 5]
+        lines = []
+        for c in chunk:
+            m = c.get("market") or {}
+            pc = m.get("price_change_pct") or {}
+            lines.append(
+                f"{c.get('symbol')}: h1={pc.get('h1')}, h24={pc.get('h24')}, "
+                f"liq={m.get('reserve_usd')}, sources={len(c.get('sources') or [])}"
             )
-        if resp.status_code != 200:
-            return None
-        text = ((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content", "")
-        return json.loads(text)
-    except Exception as e:
-        logger.debug(f"Qwen fallback error: {e}")
+        prompt = (
+            f"Classify each crypto token as one of: {cats}. "
+            f"Reply ONLY a JSON object like "
+            f'{{"classifications":[{{"symbol":"X","category":"watch","confidence":50,'
+            f'"reason":"short","verdict":"Watch Setup"}}]}}. '
+            f"Tokens:\n" + "\n".join(lines)
+        )
+        try:
+            async with httpx.AsyncClient(timeout=40) as client:
+                resp = await client.post(
+                    QWEN_URL,
+                    json={
+                        "model": "local-qwen",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.0,
+                        "max_tokens": 400,
+                    },
+                )
+            if resp.status_code != 200:
+                logger.warning(f"Qwen error {resp.status_code}: {resp.text[:200]}")
+                continue
+            text = ((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content", "")
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if not match:
+                logger.warning(f"Qwen: nicun JSON in raspuns: {text[:120]}")
+                continue
+            parsed = json.loads(match.group(0))
+            for clf in (parsed.get("classifications") or []):
+                all_clf.append(clf)
+        except Exception as e:
+            logger.warning(f"Qwen fallback error: {e}")
+            continue
+    if not all_clf:
         return None
+    return {"classifications": all_clf, "market_summary": "Qwen fallback active.", "source": "qwen"}
 
 
 def _deterministic_fallback(candidates: List[Dict]) -> Dict:
@@ -242,51 +270,83 @@ def _deterministic_fallback(candidates: List[Dict]) -> Dict:
     }
 
 
-async def judge_candidates(candidates: List[Dict]) -> List[Dict]:
+async def judge_candidates(candidates: List[Dict], db=None) -> List[Dict]:
     if not candidates:
         return []
-
-    summaries = [_build_candidate_summary(c) for c in candidates]
-    batch_size = 15
+    import time as _time
+    # --- CACHE LOOKUP (nu atinge algoritmul, doar decide ce trimitem la Haiku) ---
+    now = _time.time()
+    EARLY_TTL = 60 * 60
+    DEFAULT_TTL = 180 * 60
+    cached_clf = {}
+    to_judge = []
+    if db is not None:
+        for c in candidates:
+            sym = c.get("symbol")
+            if not sym:
+                to_judge.append(c)
+                continue
+            try:
+                entry = await db.haiku_signal_cache.find_one({"symbol": sym})
+            except Exception:
+                entry = None
+            if entry and entry.get("classification"):
+                age = now - float(entry.get("cached_at") or 0)
+                cat = (entry.get("classification") or {}).get("category", "watch")
+                ttl = EARLY_TTL if cat == "early" else DEFAULT_TTL
+                if age < ttl:
+                    cached_clf[sym] = entry.get("classification")
+                    continue
+            to_judge.append(c)
+        logger.info(f"Cache: {len(cached_clf)} din cache, {len(to_judge)} la Haiku")
+    else:
+        to_judge = list(candidates)
+    # --- JUDECATA (Haiku -> Qwen -> deterministic) NEATINSA, doar pe to_judge ---
     all_classifications = {}
-
-    for i in range(0, len(summaries), batch_size):
-        batch = summaries[i:i + batch_size]
-        batch_candidates = candidates[i:i + batch_size]
-
-        result = await call_haiku(batch)
-        if not result:
-            result = await call_qwen_fallback(batch)
-        if not result:
-            result = _deterministic_fallback(batch_candidates)
-
-        for clf in (result.get("classifications") or []):
-            sym = clf.get("symbol")
-            if sym:
-                all_classifications[sym] = clf
-
-        if i + batch_size < len(summaries):
-            await asyncio.sleep(0.5)
-
+    if to_judge:
+        summaries = [_build_candidate_summary(c) for c in to_judge]
+        batch_size = 15
+        for i in range(0, len(summaries), batch_size):
+            batch = summaries[i:i + batch_size]
+            batch_candidates = to_judge[i:i + batch_size]
+            result = await call_haiku(batch)
+            if not result:
+                result = await call_qwen_fallback(batch)
+            if not result:
+                result = _deterministic_fallback(batch_candidates)
+            for clf in (result.get("classifications") or []):
+                sym = clf.get("symbol")
+                if sym:
+                    all_classifications[sym] = clf
+                    if db is not None and clf.get("source") != "deterministic_fallback":
+                        try:
+                            await db.haiku_signal_cache.update_one(
+                                {"symbol": sym},
+                                {"$set": {"symbol": sym, "classification": clf, "cached_at": _time.time()}},
+                                upsert=True,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Cache write error {sym}: {e}")
+            if i + batch_size < len(summaries):
+                await asyncio.sleep(0.5)
+    # --- combina cache + rezultate proaspete ---
+    for sym, clf in cached_clf.items():
+        all_classifications[sym] = clf
     signals = []
     for candidate in candidates:
         sym = candidate.get("symbol")
         clf = all_classifications.get(sym)
         if not clf:
             continue
-
         category = (clf.get("category") or "watch").lower()
         if category not in ALLOWED_CATEGORIES:
             category = "watch"
-
         if category == "avoid":
             continue
-
         market = candidate.get("market") or {}
         pc = market.get("price_change_pct") or {}
         vol = market.get("volume_usd") or {}
         whale = candidate.get("whale") or {}
-
         signals.append({
             "symbol": sym,
             "name": sym,
@@ -311,11 +371,13 @@ async def judge_candidates(candidates: List[Dict]) -> List[Dict]:
             "red_flags": candidate.get("red_flags") or [],
             "whale_accumulation": whale.get("accumulation_detected", False),
             "whale_score": whale.get("whale_score", 0),
+            "whale_dump_risk": whale.get("dump_risk", False),
+            "whale_large_moves": whale.get("large_moves", 0),
+            "whale_unique_buyers": whale.get("unique_buyers", 0),
+            "whale_unique_sellers": whale.get("unique_sellers", 0),
             "multi_source": len(candidate.get("sources", [])) > 1,
             "pre_pump_activity": clf.get("pre_pump_activity", False),
             "manipulation_probability": int(clf.get("manipulation_probability") or 0),
             "dump_risk_level": clf.get("dump_risk_level", "low"),
         })
-
-    logger.info(f"Judge: {len(signals)} semnale din {len(candidates)} candidati")
     return signals

@@ -138,7 +138,32 @@ async def send_signal_alert_emails(db, signals: list):
 
     alert_signals = early + pumps + dumps
     if not alert_signals:
+        # curata dedup: nimic activ acum -> golim ce era trimis
+        try:
+            await db.sent_signal_alerts.delete_many({})
+        except Exception:
+            pass
         return
+
+    # --- DEDUP "pana dispare": trimite email o singura data per simbol cat e activ ---
+    import time as _t
+    current_syms = [s.get("symbol") for s in alert_signals if s.get("symbol")]
+    try:
+        already = await db.sent_signal_alerts.find({}).to_list(length=5000)
+        already_syms = {d["_id"] for d in already}
+    except Exception:
+        already_syms = set()
+    # semnale noi = cele care NU au primit deja email
+    fresh = [s for s in alert_signals if s.get("symbol") and s.get("symbol") not in already_syms]
+    # curata simbolurile care au disparut (nu mai sunt active) -> pot redeclansa la revenire
+    try:
+        await db.sent_signal_alerts.delete_many({"_id": {"$nin": current_syms}})
+    except Exception:
+        pass
+    if not fresh:
+        # toate semnalele active au primit deja email -> nu spamam
+        return
+    alert_signals = fresh
 
     # get active subscribers
     try:
@@ -199,7 +224,11 @@ async def send_signal_alert_emails(db, signals: list):
 </body>
 </html>"""
 
-    subject = f"⚡ PumpRadar Early Detection: {early[0]['symbol']} — market hasn't moved yet"
+    if early:
+        subject = f"⚡ PumpRadar Early Detection: {early[0]['symbol']} — market hasn't moved yet"
+    else:
+        _first = alert_signals[0]['symbol'] if alert_signals else "Signals"
+        subject = f"⚡ PumpRadar Signals: {_first} and more"
 
     sent = 0
     for user in users:
@@ -218,3 +247,18 @@ async def send_signal_alert_emails(db, signals: list):
             logger.error(f"Signal alert email error for {email}: {e}")
 
     logger.info(f"Signal alert: sent to {sent}/{len(users)} subscribers — {subject}")
+
+    # marcheaza simbolurile trimise (dedup "pana dispare") - doar daca s-a trimis ceva
+    if sent > 0:
+        import time as _t2
+        for s in alert_signals:
+            sym = s.get("symbol")
+            if sym:
+                try:
+                    await db.sent_signal_alerts.update_one(
+                        {"_id": sym},
+                        {"$set": {"category": s.get("category"), "sent_at": _t2.time()}},
+                        upsert=True,
+                    )
+                except Exception:
+                    pass

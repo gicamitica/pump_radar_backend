@@ -39,7 +39,7 @@ async def run_full_scan(db) -> Dict:
             return {"success": False, "reason": "no_enriched_candidates"}
 
         logger.info("Pas 5: AI Judge...")
-        signals = await judge_candidates(enriched)
+        signals = await judge_candidates(enriched, db)
         logger.info(f"Semnale finale: {len(signals)}")
 
         # Deduplicare si filtrare simboluri invalide
