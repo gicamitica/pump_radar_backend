@@ -23,7 +23,7 @@ Orice optimizare (cache, fallback) se face in jurul apelului AI, nu in logica lu
 - Email dedup "pana dispare": colectie sent_signal_alerts. Email o data per semnal cat e activ; se sterge cand semnalul dispare (poate redeclansa la revenire). Filtru: early(pre_pump) / pump(conf>=75) / dump-risk(conf>=70).
 - Cronometru dashboard: inel dublu (verde=varsta urca, violet=next scan scade), flash la scanare. Derivat din nextRefresh (3600 - nextRefresh).
 
-## TODO IMPORTANT (de facut pe Pi cand exista acces) — Auto-refresh + scan vs live pe pagina coin
+## [DONE 8 iun] Auto-refresh + scan vs live pe pagina coin - IMPLEMENTAT
 Backend: GATA pe cloud (coin-live cu cache 10s, verificat). Frontend: DE FACUT pe Pi (build + scp -r).
 
 Cerinta (8 iunie): pe pagina coin, fiecare valoare (pret/volum/lichiditate) sa arate DOUA valori + variatia:
