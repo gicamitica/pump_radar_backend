@@ -251,6 +251,7 @@ stripe.api_key = STRIPE_API_KEY
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # nu loga URL-urile (ascunde api-key Helius etc.)
 EXCHANGE_METADATA_CACHE: Dict[str, dict] = {}
 COIN_TICKERS_CACHE: Dict[str, List[dict]] = {}
 X_INTELLIGENCE_CACHE: Dict[str, dict] = {}
@@ -323,6 +324,11 @@ app.include_router(pump_engine_router)
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
+
+# --- on-chain intelligence module (read-only, separate writers) ---
+from onchain_routes import router as onchain_router, set_db as _set_onchain_db
+_set_onchain_db(db)
+app.include_router(onchain_router)
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer = HTTPBearer(auto_error=False)
@@ -5291,6 +5297,45 @@ async def call_claude_haiku_json(
         return {"ok": False, "provider": "claude_haiku", "error": str(exc), "json": None, "text": ""}
 
 
+async def call_claude_haiku_text(
+    *,
+    system_instruction: str,
+    user_prompt: str,
+    temperature: float = 0.3,
+    max_tokens: int = 900,
+) -> dict:
+    """Call Claude Haiku API and return plain text (chat replies)."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        return {"ok": False, "provider": "claude_haiku", "error": "no_api_key", "text": ""}
+    try:
+        def _request():
+            return requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "system": system_instruction or "",
+                    "messages": [{"role": "user", "content": user_prompt or ""}],
+                },
+                timeout=45,
+            )
+        resp = await asyncio.to_thread(_request)
+        if resp.status_code >= 400:
+            return {"ok": False, "provider": "claude_haiku", "status_code": resp.status_code, "error": resp.text[:300], "text": ""}
+        data = resp.json() or {}
+        text = ((data.get("content") or [{}])[0].get("text") or "").strip()
+        return {"ok": bool(text), "provider": "claude_haiku", "model": "claude-haiku-4-5-20251001", "text": text}
+    except Exception as exc:
+        return {"ok": False, "provider": "claude_haiku", "error": str(exc), "text": ""}
+
+
 async def apply_local_qwen_to_decision_signals(decision_signals: List[dict]) -> List[dict]:
     """
     Local-first AI judge using Qwen/llama.cpp.
@@ -7591,6 +7636,27 @@ async def ai_chat(req: ChatRequest, user=Depends(require_active_subscription)):
         user_sub = "Monthly" if sub == "monthly" else "Annual" if sub == "annual" else "Free Trial"
         user_name = user.get("name", "User")
         
+        # On-chain radar context (read-only, last 24h)
+        try:
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            _since = _dt.now(_tz.utc) - _td(hours=24)
+            _oc = db["onchain_events"]
+            oc_watch = await _oc.count_documents({"recommendation.verdict": "WATCH", "block_time": {"$gte": _since}})
+            oc_caution = await _oc.count_documents({"recommendation.verdict": "CAUTION", "block_time": {"$gte": _since}})
+            oc_avoid = await _oc.count_documents({"recommendation.verdict": {"$in": ["AVOID", "HONEYPOT"]}, "block_time": {"$gte": _since}})
+            _top = await _oc.find(
+                {"recommendation.verdict": "WATCH", "block_time": {"$gte": _since}},
+                {"_id": 0, "token_symbol": 1, "chain": 1, "scores.early.score": 1},
+            ).sort("scores.early.score", -1).limit(5).to_list(5)
+            oc_top = ", ".join(
+                f"{(t.get('token_symbol') or '?')} [{t.get('chain','').upper()}] ({(t.get('scores',{}).get('early',{}) or {}).get('score','?')})"
+                for t in _top
+            ) or "None"
+        except Exception as _oce:
+            logger.warning("ai_chat onchain context failed: %s", _oce)
+            oc_watch = oc_caution = oc_avoid = 0
+            oc_top = "N/A"
+
         system_instruction = f"""You are PumpRadar AI - an intelligent crypto market assistant. You're knowledgeable, helpful, and precise.
 
 PLATFORM OVERVIEW:
@@ -7604,6 +7670,14 @@ CURRENT LIVE DATA:
 - Fear & Greed Index: {fear_greed.get('value', 'N/A')}/100 ({fear_greed.get('classification', 'N/A')})
 - Trending on CoinGecko: {', '.join(trending[:5]) if trending else 'N/A'}
 - Market Summary: {summary}
+
+
+ON-CHAIN RADAR (newly launched tokens, last 24h, ETH/BSC/Solana, auto-scored):
+- WATCH (clean, worth watching): {oc_watch}
+- CAUTION (has flags): {oc_caution}
+- AVOID/HONEYPOT (likely scam): {oc_avoid}
+- Top early plays: {oc_top}
+The radar detects brand-new DEX pairs within seconds and scores them by Early (upside) and Threat (danger). Point users to the On-Chain Radar page for live cards.
 
 USER CONTEXT:
 - Name: {user_name}
@@ -7637,7 +7711,7 @@ RESPONSE GUIDELINES:
 
 If asked about a specific coin, check if it's in our current signals and provide details."""
         
-        ai_result = await call_openai_compatible_text(
+        ai_result = await call_claude_haiku_text(
             system_instruction=system_instruction,
             user_prompt=req.message,
             temperature=0.3,
@@ -11860,7 +11934,10 @@ def derive_telegram_source_profile(doc: dict) -> dict:
     accuracy_4h = float(doc.get("accuracy_4h", 0) or 0)
     avg_move_4h_abs = float(doc.get("avg_move_4h_abs", 0) or 0)
 
-    if accuracy_4h >= 65 and noise_ratio <= 25 and verified_count >= 6:
+    _has_quality_data = doc.get("noise_ratio") is not None and doc.get("structured_ratio") is not None
+    if (pump_calls + dump_calls) < 10 or not _has_quality_data:
+        quality_badge = "Not enough data"
+    elif accuracy_4h >= 65 and noise_ratio <= 25 and verified_count >= 6:
         quality_badge = "High Signal Quality"
     elif accuracy_4h >= 52 and avg_move_4h_abs >= 3 and verified_count >= 4:
         quality_badge = "Fast but Risky"
@@ -14709,6 +14786,624 @@ async def get_cex_prices(symbol: str):
     payload = {"binance": binance_price, "coinbase": coinbase_price}
     _cex_price_cache[sym] = (_t.time(), payload)
     return api_ok(payload)
+
+_holders_cache: Dict[str, tuple] = {}
+
+_MORALIS_CHAINS = {
+    "eth": "0x1", "ethereum": "0x1",
+    "bsc": "0x38", "binance-smart-chain": "0x38",
+    "polygon": "0x89", "polygon-pos": "0x89", "polygon_pos": "0x89",
+    "arbitrum": "0xa4b1", "arbitrum-one": "0xa4b1",
+    "base": "0x2105",
+    "optimism": "0xa", "avalanche": "0xa86a", "avax": "0xa86a",
+    "solana": "solana", "sol": "solana",
+}
+
+@app.get("/api/crypto/holders/{chain}/{address}")
+async def get_token_holders(chain: str, address: str):
+    """Top holderi + distributie (balene/rechini/...) via Moralis. EVM + Solana. Cache 5 min."""
+    import time as _t
+    import httpx as _httpx
+    key = os.getenv("MORALIS_API_KEY")
+    if not key:
+        return api_ok({"available": False, "error": "no_api_key"})
+    ch = (chain or "").lower().strip()
+    mch = _MORALIS_CHAINS.get(ch)
+    if not mch or not address:
+        return api_ok({"available": False, "error": "unsupported_chain"})
+
+    cache_key = mch + ":" + address
+    cached = _holders_cache.get(cache_key)
+    if cached and (_t.time() - cached[0]) < 300:
+        return api_ok(cached[1])
+
+    headers = {"X-API-Key": key, "accept": "application/json"}
+    payload = {"available": True, "chain": ch, "total_holders": None,
+               "distribution": None, "top_holders": [], "concentration_top10": None}
+    try:
+        async with _httpx.AsyncClient(timeout=15) as client:
+            if mch == "solana":
+                base = "https://solana-gateway.moralis.io/token/mainnet/" + address
+                try:
+                    rs = await client.get(base + "/holders", headers=headers)
+                    if rs.status_code == 200:
+                        j = rs.json() or {}
+                        payload["total_holders"] = j.get("totalHolders")
+                        payload["distribution"] = j.get("holderDistribution")
+                except Exception:
+                    pass
+                try:
+                    rt = await client.get(base + "/top-holders", headers=headers, params={"limit": 20})
+                    if rt.status_code == 200:
+                        jt = rt.json() or {}
+                        rows = jt.get("result") or jt.get("holders") or []
+                        payload["top_holders"] = [{
+                            "address": h.get("ownerAddress") or h.get("address"),
+                            "pct": h.get("percentageRelativeToTotalSupply") or h.get("percentage"),
+                            "amount": h.get("balanceFormatted") or h.get("amount"),
+                            "is_contract": h.get("isContract"),
+                        } for h in rows[:20]]
+                except Exception:
+                    pass
+            else:
+                base = "https://deep-index.moralis.io/api/v2.2/erc20/" + address
+                try:
+                    ra = await client.get(base + "/holders", headers=headers, params={"chain": mch})
+                    if ra.status_code == 200:
+                        j = ra.json() or {}
+                        payload["total_holders"] = j.get("totalHolders")
+                        payload["distribution"] = j.get("holderDistribution")
+                        sup = j.get("holderSupply") or {}
+                        top10 = sup.get("top10") or {}
+                        payload["concentration_top10"] = top10.get("supplyPercent")
+                except Exception:
+                    pass
+                try:
+                    rt = await client.get(base + "/owners", headers=headers,
+                                          params={"chain": mch, "order": "DESC", "limit": 20})
+                    if rt.status_code == 200:
+                        jt = rt.json() or {}
+                        rows = jt.get("result") or []
+                        payload["top_holders"] = [{
+                            "address": h.get("owner_address"),
+                            "pct": h.get("percentage_relative_to_total_supply"),
+                            "amount": h.get("balance_formatted"),
+                            "label": h.get("owner_address_label"),
+                            "is_contract": h.get("is_contract"),
+                        } for h in rows[:20]]
+                except Exception:
+                    pass
+    except Exception as e:
+        return api_ok({"available": False, "error": str(e)})
+
+    _holders_cache[cache_key] = (_t.time(), payload)
+    return api_ok(payload)
+
+_GP_PLATFORM_CANDIDATES = {
+    "eth": ["ethereum", "eth"], "ethereum": ["ethereum", "eth"],
+    "bsc": ["binance-smart-chain", "bsc"], "binance-smart-chain": ["binance-smart-chain", "bsc"],
+    "polygon": ["polygon-pos", "polygon", "matic-network"], "polygon-pos": ["polygon-pos", "polygon"],
+    "arbitrum": ["arbitrum-one", "arbitrum"], "arbitrum-one": ["arbitrum-one", "arbitrum"],
+    "optimism": ["optimistic-ethereum", "optimism"],
+    "avalanche": ["avalanche", "avalanche-2"], "avax": ["avalanche"],
+    "base": ["base"],
+    "solana": ["solana"], "sol": ["solana"],
+}
+
+def _osint_normalize_security(raw: dict) -> dict:
+    out = {"available": False, "source": "goplus"}
+    if not isinstance(raw, dict) or not raw.get("available"):
+        if isinstance(raw, dict) and raw.get("error"):
+            out["error"] = raw["error"]
+        return out
+    td = raw.get("data") or {}
+    if not isinstance(td, dict) or not td:
+        return out
+    def _st(v):
+        if isinstance(v, dict):
+            return str(v.get("status", "")).strip()
+        return str(v).strip() if v is not None else ""
+    def _flag(k):
+        return _st(td.get(k)) == "1"
+    def _tax(k):
+        x = _st(td.get(k))
+        if x == "":
+            return None
+        try:
+            f = float(x)
+        except Exception:
+            return None
+        return round(f * 100, 2) if abs(f) <= 1 else round(f, 2)
+    buy_tax = _tax("buy_tax")
+    sell_tax = _tax("sell_tax")
+    is_honeypot = _flag("is_honeypot")
+    is_mintable = _flag("is_mintable") or _flag("mintable")
+    pausable = _flag("transfer_pausable") or _flag("freezable")
+    open_source = _flag("is_open_source")
+    score = 65.0
+    if is_honeypot: score -= 60
+    if _flag("cannot_sell_all"): score -= 45
+    if _flag("malicious_address"): score -= 40
+    if _st(td.get("is_open_source")) != "" and not open_source: score -= 20
+    if is_mintable: score -= 10
+    if pausable: score -= 10
+    if buy_tax and buy_tax >= 20: score -= 18
+    if sell_tax and sell_tax >= 20: score -= 18
+    score = max(0.0, min(100.0, score))
+    contract_risk = "HIGH" if score < 40 else ("MEDIUM" if score < 65 else "LOW")
+    out.update({
+        "available": True, "source": "goplus",
+        "is_honeypot": is_honeypot,
+        "buy_tax": buy_tax, "sell_tax": sell_tax,
+        "is_mintable": is_mintable, "transfer_pausable": pausable,
+        "is_open_source": open_source,
+        "contract_risk": contract_risk, "score": round(score, 1),
+    })
+    return out
+
+
+def _osint_normalize_social(raw) -> dict:
+    out = {"available": False, "source": "lunarcrush"}
+    if not isinstance(raw, dict) or not raw:
+        return out
+    def _n(k):
+        v = raw.get(k)
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+    mentions = _n("mentions_24h")
+    engagements = _n("engagements_24h")
+    creators = _n("creators_24h")
+    galaxy = _n("galaxy_score")
+    alt_rank = _n("alt_rank")
+    sentiment_pct = _n("sentiment_pct")
+    social_dom = _n("social_dominance_pct")
+    summary = (raw.get("summary") or "").strip()
+    if (mentions is None and engagements is None and galaxy is None
+            and sentiment_pct is None and social_dom is None and not summary):
+        return out
+    if sentiment_pct is None:
+        sentiment = None
+    elif sentiment_pct >= 60:
+        sentiment = "Bullish"
+    elif sentiment_pct <= 40:
+        sentiment = "Bearish"
+    else:
+        sentiment = "Neutral"
+    out.update({
+        "available": True, "source": "lunarcrush",
+        "mentions_24h": int(mentions) if mentions is not None else None,
+        "engagements_24h": int(engagements) if engagements is not None else None,
+        "creators_24h": int(creators) if creators is not None else None,
+        "galaxy_score": galaxy,
+        "alt_rank": int(alt_rank) if alt_rank is not None else None,
+        "sentiment_pct": int(sentiment_pct) if sentiment_pct is not None else None,
+        "sentiment": sentiment,
+        "social_dominance_pct": social_dom,
+        "summary": (raw.get("summary") or "")[:280] or None,
+        "limited_mode": bool(raw.get("limited_mode")),
+    })
+    return out
+
+
+_ETHERSCAN_CHAINIDS = {
+    "eth": 1, "ethereum": 1, "bsc": 56, "binance-smart-chain": 56,
+    "polygon": 137, "polygon-pos": 137, "arbitrum": 42161, "arbitrum-one": 42161,
+    "optimism": 10, "avalanche": 43114, "avax": 43114, "base": 8453,
+}
+_deployer_cache = {}
+
+def _osint_deployer(chain, address, goplus_raw=None) -> dict:
+    import requests as _rq
+    import time
+    out = {"available": False, "source": "etherscan"}
+    ch = (chain or "").lower().strip()
+    addr = (address or "").strip()
+    cid = _ETHERSCAN_CHAINIDS.get(ch)
+    if not cid or not addr:
+        out["error"] = "unsupported_chain"
+        return out
+    key = os.getenv("ETHERSCAN_API_KEY", "")
+    if not key:
+        out["error"] = "no_api_key"
+        return out
+    ck = str(cid) + ":" + addr.lower()
+    cached = _deployer_cache.get(ck)
+    if cached and (time.time() - cached[0]) < 1800:
+        return cached[1]
+    base = "https://api.etherscan.io/v2/api"
+    try:
+        r = _rq.get(base, params={"chainid": cid, "module": "contract",
+                    "action": "getcontractcreation", "contractaddresses": addr, "apikey": key}, timeout=15)
+        j = r.json() or {}
+        rows = j.get("result") or []
+        if j.get("status") != "1" or not rows:
+            out["error"] = "no_creation_data"
+            return out
+        row = rows[0]
+        creator = (row.get("contractCreator") or "").lower()
+        created_ts = int(row.get("timestamp") or 0)
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+    age_days = int((time.time() - created_ts) / 86400) if created_ts else None
+    deployed_count = None
+    try:
+        rt = _rq.get(base, params={"chainid": cid, "module": "account", "action": "txlist",
+                     "address": creator, "startblock": 0, "endblock": 99999999,
+                     "page": 1, "offset": 100, "sort": "asc", "apikey": key}, timeout=15)
+        jt = rt.json() or {}
+        txs = jt.get("result") or []
+        if isinstance(txs, list):
+            deployed_count = sum(1 for t in txs if (t.get("to") in (None, "", "0x")) and t.get("contractAddress"))
+    except Exception:
+        deployed_count = None
+    gp = (goplus_raw or {}).get("data") or {}
+    def _flag(k):
+        v = gp.get(k)
+        return str(v.get("status") if isinstance(v, dict) else v) == "1"
+    same_creator_honeypot = _flag("honeypot_with_same_creator")
+    try:
+        creator_pct = float(gp.get("creator_percent") or 0) * 100
+    except Exception:
+        creator_pct = None
+    score = 70.0
+    flags = []
+    if same_creator_honeypot:
+        score -= 50; flags.append("creator_made_honeypots")
+    if age_days is not None:
+        if age_days < 7: score -= 25; flags.append("contract_very_new")
+        elif age_days < 30: score -= 12; flags.append("contract_new")
+        elif age_days > 365: score += 10
+    if deployed_count is not None and deployed_count >= 20:
+        score -= 12; flags.append("prolific_deployer")
+    if creator_pct is not None and creator_pct >= 5:
+        score -= 15; flags.append("creator_holds_supply")
+    score = max(0.0, min(100.0, score))
+    risk_pct = round(100 - score, 1)
+    risk_level = "HIGH" if risk_pct >= 60 else "MEDIUM" if risk_pct >= 35 else "LOW"
+    out.update({
+        "available": True, "source": "etherscan",
+        "deployer": creator, "age_days": age_days,
+        "deployed_contracts": deployed_count,
+        "creator_percent": round(creator_pct, 4) if creator_pct is not None else None,
+        "same_creator_honeypot": same_creator_honeypot,
+        "risk_pct": risk_pct, "risk_level": risk_level, "flags": flags,
+    })
+    _deployer_cache[ck] = (time.time(), out)
+    return out
+
+
+def _osint_coingecko(symbol, name=None) -> dict:
+    out = {"available": False, "source": "coingecko"}
+    coin_id = ""
+    try:
+        if symbol:
+            coin_id = resolve_coingecko_coin_id(symbol, preferred_name=name) or ""
+            snap = get_coingecko_market_snapshot(symbol, preferred_name=name, preferred_coin_id=coin_id)
+        else:
+            snap = {}
+    except Exception:
+        return out
+    if coin_id:
+        out["coin_id"] = coin_id
+    if not isinstance(snap, dict) or not snap:
+        return out
+    out.update({
+        "available": True, "source": "coingecko",
+        "coin_id": snap.get("id") or coin_id or None,
+        "name": snap.get("name"),
+        "image": snap.get("image"),
+        "market_cap": snap.get("market_cap"),
+        "market_cap_rank": snap.get("market_cap_rank"),
+        "price_usd": snap.get("current_price"),
+        "price_change_h24": snap.get("price_change_percentage_24h"),
+    })
+    return out
+
+
+async def _osint_recent_with_logos(snap, limit=6):
+    """Primele semnale unice + logo CoinGecko (paralel, cache-uit). Best-effort."""
+    if not snap:
+        return []
+    seen = set()
+    flat = []
+    for c in ("pump_signals", "risk_signals", "watch_signals", "dump_signals", "dex_signals", "early_signals"):
+        for s in (snap.get(c) or []):
+            sym = (s.get("symbol") or "").upper()
+            if sym and sym not in seen:
+                seen.add(sym)
+                flat.append(s)
+            if len(flat) >= limit:
+                break
+        if len(flat) >= limit:
+            break
+    tasks = [asyncio.to_thread(_osint_coingecko, s.get("symbol"), s.get("name")) for s in flat]
+    cgs = await asyncio.gather(*tasks, return_exceptions=True)
+    out = []
+    for s, cg in zip(flat, cgs):
+        img = cg.get("image") if isinstance(cg, dict) else None
+        out.append({
+            "symbol": s.get("symbol"), "name": s.get("name"),
+            "network": s.get("network"), "token_address": s.get("token_address"),
+            "image": img,
+        })
+    return out
+
+
+_CG_PLATFORM_TO_CHAIN = {
+    "ethereum": "eth", "binance-smart-chain": "bsc", "polygon-pos": "polygon",
+    "arbitrum-one": "arbitrum", "optimistic-ethereum": "optimism",
+    "avalanche": "avalanche", "base": "base", "solana": "solana",
+}
+
+def _osint_resolve_token(query: str) -> dict:
+    out = {"found": False}
+    q = (query or "").strip()
+    if not q:
+        return out
+    try:
+        coin_id = resolve_coingecko_coin_id(q) or ""
+        if not coin_id:
+            return out
+        details = get_coin_extended_details(coin_id)
+        if not isinstance(details, dict) or not details:
+            return out
+        platform, address = pick_primary_contract(details)
+        if not platform or not address:
+            return out
+        chain = _CG_PLATFORM_TO_CHAIN.get(platform, platform)
+        out.update({
+            "found": True, "chain": chain, "address": address,
+            "coin_id": coin_id, "name": details.get("name"),
+            "symbol": (details.get("symbol") or "").upper(),
+        })
+    except Exception:
+        return {"found": False}
+    return out
+
+
+@app.get("/api/crypto/osint-resolve/{query}")
+async def osint_resolve(query: str):
+    """Rezolva orice symbol/coin -> chain+address via CoinGecko (pt tokenuri din afara snapshotului)."""
+    res = await asyncio.to_thread(_osint_resolve_token, query)
+    return api_ok(res)
+
+
+@app.get("/api/crypto/osint/{chain}/{address}")
+async def get_osint_overview(chain: str, address: str):
+    """OSINT Lab Faza 1: agregare read-only (snapshot v2 + holders Moralis).
+    NU atinge scanner/judge/categorii - doar citeste si combina."""
+    addr = (address or "").strip()
+    addr_l = addr.lower()
+    ch = (chain or "").lower().strip()
+
+    sig = None
+    snap = await get_latest_snapshot(db)
+    last_updated = snap.get("timestamp") if snap else None
+    if snap:
+        for cat in ("pump_signals", "dump_signals", "risk_signals",
+                    "watch_signals", "dex_signals", "early_signals"):
+            for s in (snap.get(cat) or []):
+                ta = (s.get("token_address") or "").lower()
+                sym = (s.get("symbol") or "").lower()
+                if (addr_l and ta == addr_l) or (sym and sym == addr_l):
+                    sig = s
+                    break
+            if sig:
+                break
+
+    holders = {}
+    try:
+        hres = await get_token_holders(ch, addr)
+        if isinstance(hres, dict):
+            holders = hres.get("data", {}) or {}
+    except Exception:
+        holders = {}
+
+    security = {"available": False, "source": "goplus"}
+    try:
+        _gp_raw = {}
+        for _plat in _GP_PLATFORM_CANDIDATES.get(ch, [ch]):
+            _r = await asyncio.to_thread(get_goplus_security, _plat, addr)
+            if isinstance(_r, dict) and _r.get("available"):
+                _gp_raw = _r
+                break
+            _gp_raw = _r or _gp_raw
+        security = _osint_normalize_security(_gp_raw)
+    except Exception:
+        security = {"available": False, "source": "goplus"}
+
+    market_extra = {"available": False, "source": "coingecko"}
+    try:
+        _sym0 = (sig or {}).get("symbol")
+        _nm0 = (sig or {}).get("name")
+        if _sym0:
+            market_extra = await asyncio.to_thread(_osint_coingecko, _sym0, _nm0)
+    except Exception:
+        market_extra = {"available": False, "source": "coingecko"}
+
+    social = {"available": False, "source": "lunarcrush"}
+    try:
+        _sym = (sig or {}).get("symbol")
+        _nm = (market_extra.get("name") if isinstance(market_extra, dict) else None) or (sig or {}).get("name")
+        if _sym:
+            _lc = await asyncio.to_thread(get_lunarcrush_topic_intelligence, _sym, _nm)
+            social = _osint_normalize_social(_lc)
+    except Exception:
+        social = {"available": False, "source": "lunarcrush"}
+
+    deployer = {"available": False, "source": "etherscan"}
+    try:
+        _gp_dep = await asyncio.to_thread(get_goplus_security, _GP_PLATFORM_CANDIDATES.get(ch, [ch])[0], addr)
+        deployer = await asyncio.to_thread(_osint_deployer, ch, addr, _gp_dep)
+    except Exception:
+        deployer = {"available": False, "source": "etherscan"}
+
+    recent = []
+    try:
+        recent = await _osint_recent_with_logos(snap)
+    except Exception:
+        recent = []
+
+    def _risk_level(s):
+        if not s:
+            return "UNKNOWN"
+        mp = s.get("manipulation_probability") or 0
+        dr = (s.get("dump_risk_level") or "").lower()
+        if dr == "high" or mp >= 60:
+            return "HIGH"
+        if dr == "medium" or mp >= 30:
+            return "MEDIUM"
+        return "LOW"
+
+    s = sig or {}
+    payload = {
+        "found": sig is not None,
+        "query": {"chain": ch, "address": addr},
+        "last_updated": last_updated,
+        "token": {
+            "symbol": s.get("symbol"),
+            "name": s.get("name"),
+            "chain": s.get("network") or ch,
+            "price_usd": s.get("price_usd"),
+            "price_change_h24": s.get("price_change_h24"),
+            "price_change_h1": s.get("price_change_h1"),
+            "total_holders": holders.get("total_holders"),
+        },
+        "market": {
+            "liquidity_usd": s.get("reserve_usd"),
+            "volume_h24": s.get("volume_h24"),
+            "buy_sell_ratio_h1": s.get("buy_sell_ratio_h1"),
+            "pool_url": s.get("pool_url"),
+        },
+        "verdict": {
+            "risk_level": _risk_level(sig),
+            "verdict": s.get("verdict"),
+            "confidence": s.get("confidence"),
+            "reason": s.get("reason"),
+            "ai_source": s.get("ai_source"),
+            "dump_risk_level": s.get("dump_risk_level"),
+            "manipulation_probability": s.get("manipulation_probability"),
+        },
+        "holders": holders,
+        "signal_meta": {
+            "sources": s.get("sources") or [],
+            "mentions": s.get("mentions"),
+            "multi_source": s.get("multi_source"),
+            "pre_pump_activity": s.get("pre_pump_activity"),
+            "red_flags": s.get("red_flags") or [],
+            "whale_score": s.get("whale_score"),
+            "whale_accumulation": s.get("whale_accumulation"),
+            "whale_dump_risk": s.get("whale_dump_risk"),
+            "whale_unique_buyers": s.get("whale_unique_buyers"),
+            "whale_unique_sellers": s.get("whale_unique_sellers"),
+        },
+        "security": security,
+        "social": social,
+        "market_extra": market_extra,
+        "recent": recent,
+        "news": {"available": False, "source": "cryptopanic", "phase": 2},
+        "deployer": deployer,
+    }
+
+    try:
+        cgm = await asyncio.to_thread(lookup_coingecko_contract_metadata, ch, addr)
+    except Exception:
+        cgm = {}
+    if not isinstance(cgm, dict):
+        cgm = {}
+
+    _sym = (sig or {}).get("symbol") or cgm.get("symbol")
+    _nm = cgm.get("name") or (sig or {}).get("name")
+
+    if sig is None and cgm.get("available"):
+        md = cgm.get("market_data") or {}
+        payload["token"]["symbol"] = payload["token"].get("symbol") or _sym
+        payload["token"]["name"] = payload["token"].get("name") or _nm
+        if payload["token"].get("price_usd") is None:
+            payload["token"]["price_usd"] = md.get("current_price_usd")
+        if payload["token"].get("price_change_h24") is None:
+            payload["token"]["price_change_h24"] = md.get("price_change_24h")
+        if payload["market"].get("volume_h24") is None:
+            payload["market"]["volume_h24"] = md.get("total_volume_usd")
+        try:
+            cg2 = await asyncio.to_thread(_osint_coingecko, _sym, _nm)
+        except Exception:
+            cg2 = {}
+        if isinstance(cg2, dict) and cg2.get("available"):
+            payload["market_extra"] = cg2
+        else:
+            payload["market_extra"] = {
+                "available": True, "source": "coingecko",
+                "coin_id": cgm.get("coin_id"), "name": _nm,
+                "market_cap": md.get("market_cap_usd"),
+            }
+
+    if (not isinstance(social, dict) or not social.get("available")) and _sym:
+        try:
+            _lc2 = await asyncio.to_thread(get_lunarcrush_topic_intelligence, _sym, _nm)
+            _s2 = _osint_normalize_social(_lc2)
+            if isinstance(_s2, dict) and _s2.get("available"):
+                payload["social"] = _s2
+        except Exception:
+            pass
+
+    if cgm.get("available"):
+        md = cgm.get("market_data") or {}
+        _soc = cgm.get("socials") or {}
+        _links = []
+        if cgm.get("website"):
+            _links.append({"label": "Website", "url": cgm.get("website")})
+        if _soc.get("twitter"):
+            _links.append({"label": "Twitter/X", "url": "https://x.com/" + str(_soc["twitter"])})
+        if _soc.get("telegram"):
+            _links.append({"label": "Telegram", "url": "https://t.me/" + str(_soc["telegram"])})
+        if _soc.get("subreddit"):
+            _links.append({"label": "Reddit", "url": _soc["subreddit"]})
+        payload["links"] = _links
+        _cid = (payload.get("market_extra") or {}).get("coin_id") or cgm.get("coin_id")
+        _snap = {}
+        try:
+            _snap = await asyncio.to_thread(get_coingecko_market_snapshot, _sym, _nm, _cid) or {}
+        except Exception:
+            _snap = {}
+        payload["cg_metrics"] = {
+            "available": True,
+            "rank": _snap.get("market_cap_rank"),
+            "ath": _snap.get("ath"),
+            "ath_change_pct": _snap.get("ath_change_percentage"),
+            "change_7d": _snap.get("price_change_percentage_7d_in_currency"),
+            "circulating": _snap.get("circulating_supply"),
+            "total_supply": _snap.get("total_supply"),
+            "watchlist_users": cgm.get("watchlist_portfolio_users"),
+        }
+        payload["about"] = {
+            "available": True,
+            "categories": (cgm.get("categories") or [])[:4],
+            "description": (cgm.get("description") or "")[:240],
+        }
+
+    if not payload["market"].get("pool_url"):
+        try:
+            _plat = COINGECKO_PLATFORM_BY_CHAIN.get((ch or "").strip().lower())
+            _pools = await asyncio.to_thread(fetch_geckoterminal_token_pools, _plat, addr) if _plat else []
+            _pools = sorted(_pools, key=lambda x: x.get("volume_usd") or 0, reverse=True)
+            if _pools and _pools[0].get("url"):
+                _best = _pools[0]
+                payload["market"]["pool_url"] = _best["url"]
+                payload["chart_meta"] = {
+                    "dex": _best.get("name"),
+                    "pair": _best.get("pair"),
+                    "contract": addr,
+                    "verified_source": "CoinGecko" if cgm.get("coin_id") else None,
+                }
+        except Exception:
+            pass
+    return api_ok(payload)
+
+
 
 @app.post("/api/admin/trigger-scan-v2")
 async def trigger_scan_v2(request: Request):

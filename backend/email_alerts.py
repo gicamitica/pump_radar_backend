@@ -136,7 +136,7 @@ async def send_signal_alert_emails(db, signals: list):
     pumps = [s for s in signals if s.get("category") == "pump" and s.get("confidence", 0) >= 75]
     dumps = [s for s in signals if s.get("category") in ("dump", "risk") and s.get("confidence", 0) >= 70]
 
-    alert_signals = early + pumps + dumps
+    alert_signals = early  # doar early (cu pre-pump) declanseaza email
     if not alert_signals:
         # curata dedup: nimic activ acum -> golim ce era trimis
         try:
