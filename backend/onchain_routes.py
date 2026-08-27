@@ -73,13 +73,41 @@ async def new_pairs(
     since_minutes: int = Query(720, ge=1, le=20160),
     min_liq_usd: float = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    dedupe: bool = Query(False),
 ):
     q = {"event_type": "pair_created"}
     q.update(_chain_filter(chain))
     q.update(_since_filter(since_minutes))
     if min_liq_usd > 0:
-        q["enrichment.liquidity.initial_usd"] = {"$gte": min_liq_usd}
-    rows = await _find(q, [("block_time", -1)], limit)
+        # gecko.reserve_usd is stored as a string; compare it numerically.
+        q["$expr"] = {
+            "$gte": [
+                {"$convert": {
+                    "input": "$gecko.reserve_usd",
+                    "to": "double",
+                    "onError": 0.0,
+                    "onNull": 0.0,
+                }},
+                min_liq_usd,
+            ]
+        }
+    rows = await _find(q, [("block_time", -1)], limit * 3 if dedupe else limit)
+    if dedupe:
+        seen: Dict[str, Any] = {}
+        for r in rows:
+            key = (r.get("token_address") or "").lower()
+            if not key:
+                continue
+            try:
+                liq = float((r.get("gecko") or {}).get("reserve_usd") or 0)
+            except (TypeError, ValueError):
+                liq = 0.0
+            prev = seen.get(key)
+            if prev is None or liq > prev[0]:
+                seen[key] = (liq, r)
+        rows = [v[1] for v in seen.values()]
+        rows.sort(key=lambda d: d.get("block_time") or "", reverse=True)
+        rows = rows[:limit]
     return {"count": len(rows), "chain": chain, "events": rows}
 
 

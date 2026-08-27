@@ -24,6 +24,12 @@ ALLOWED_CATEGORIES = {"pump", "dump", "risk", "watch", "avoid", "dex", "early"}
 
 SYSTEM_PROMPT = """You are PumpRadar AI Judge — a crypto signal classifier.
 
+ON-CHAIN VALIDATION (Dune data, when dune_validated=true):
+- dune_unique_buyers_1h = distinct wallets that bought in the last hour (factual on-chain data).
+- If dune_unique_buyers_1h < 10, the token has NO real buying interest right now. Do NOT classify as pump or early regardless of other momentum indicators — use watch instead, or add "low on-chain conviction" to the reason.
+- If dune_net_flow_usd_1h is strongly negative (more selling than buying), treat pump claims skeptically.
+- If dune_validated=false the data was unavailable — judge normally on other fields.
+
 Your job: classify each token setup into exactly one category.
 
 Categories:
@@ -100,6 +106,11 @@ def _build_candidate_summary(candidate: Dict) -> Dict:
         "buy_tax": security.get("buy_tax"),
         "sell_tax": security.get("sell_tax"),
         "is_open_source": security.get("is_open_source"),
+        # Dune on-chain validation (factual, ETH only for now; None = not available)
+        "dune_validated": candidate.get("dune_validated", False),
+        "dune_unique_buyers_1h": candidate.get("unique_buyers_1h"),
+        "dune_unique_sellers_1h": candidate.get("unique_sellers_1h"),
+        "dune_net_flow_usd_1h": candidate.get("net_flow_usd_1h"),
     }
 
 
@@ -364,6 +375,10 @@ async def judge_candidates(candidates: List[Dict], db=None) -> List[Dict]:
             "pool_url": candidate.get("pool_url"),
             "price_usd": candidate.get("price_usd"),
             "reserve_usd": candidate.get("reserve_usd"),
+            "dune_validated": candidate.get("dune_validated", False),
+            "dune_unique_buyers_1h": candidate.get("unique_buyers_1h"),
+            "dune_unique_sellers_1h": candidate.get("unique_sellers_1h"),
+            "dune_net_flow_usd_1h": candidate.get("net_flow_usd_1h"),
             "volume_h24": vol.get("h24"),
             "price_change_h1": pc.get("h1"),
             "price_change_h24": pc.get("h24"),

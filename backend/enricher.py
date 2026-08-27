@@ -392,6 +392,67 @@ async def fetch_goplus_security(client: httpx.AsyncClient, chain: str, token_add
         return {"available": False}
 
 
+_solana_exchange_identity_cache: Dict[str, bool] = {}
+
+
+async def _is_solana_exchange_wallet(client: httpx.AsyncClient, address: str) -> bool:
+    """Uses Helius Wallet Identity API to check if an address is a known
+    CEX wallet. Replaces unreliable substring matching - Solana addresses
+    are base58 strings and never literally contain 'binance' etc, so the
+    previous check almost never matched anything real."""
+    if not address:
+        return False
+    if address in _solana_exchange_identity_cache:
+        return _solana_exchange_identity_cache[address]
+    if not HELIUS_API_KEY:
+        return False
+    try:
+        resp = await client.get(
+            f"https://api.helius.xyz/v1/wallet/{address}/identity",
+            params={"api-key": HELIUS_API_KEY},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            _solana_exchange_identity_cache[address] = False
+            return False
+        data = resp.json() or {}
+        category = str(data.get("category", "")).upper()
+        is_cex = category == "CEX"
+        _solana_exchange_identity_cache[address] = is_cex
+        return is_cex
+    except Exception:
+        _solana_exchange_identity_cache[address] = False
+        return False
+
+
+_solana_pools_cache: Dict[str, set] = {}
+
+
+async def _get_solana_token_pools(client: httpx.AsyncClient, token_address: str) -> set:
+    """Returns a set of lowercase DEX pool addresses for this token on Solana,
+    via GeckoTerminal. A transfer TO one of these pools means the whale SOLD
+    the token (swapped it away) - without this check, sells via DEX swap were
+    being miscounted as buys, since only known-CEX destinations were excluded."""
+    if token_address in _solana_pools_cache:
+        return _solana_pools_cache[token_address]
+    pools: set = set()
+    try:
+        r = await client.get(
+            f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{token_address}/pools",
+            timeout=10,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            for item in d.get("data", [])[:5]:
+                addr = (item.get("attributes", {}) or {}).get("address", "")
+                if addr:
+                    pools.add(addr.lower())
+    except Exception:
+        pass
+    _solana_pools_cache[token_address] = pools
+    return pools
+
+
 async def fetch_whale_activity_helius(client: httpx.AsyncClient, token_address: str, symbol: str) -> Dict:
     """Detecteaza activitate whale pentru tokeni Solana via Helius."""
     if not HELIUS_API_KEY or not token_address:
@@ -411,7 +472,7 @@ async def fetch_whale_activity_helius(client: httpx.AsyncClient, token_address: 
         large_moves = 0
         unique_buyers = set()
         unique_sellers = set()
-        KNOWN_EXCHANGES = {"binance", "coinbase", "kraken", "okx"}
+        pools = await _get_solana_token_pools(client, token_address)
 
         for tx in txs:
             for transfer in tx.get("tokenTransfers", []):
@@ -420,8 +481,9 @@ async def fetch_whale_activity_helius(client: httpx.AsyncClient, token_address: 
                     continue
                 to_wallet = transfer.get("toUserAccount", "")
                 from_wallet = transfer.get("fromUserAccount", "")
-                to_exchange = any(ex in to_wallet.lower() for ex in KNOWN_EXCHANGES)
-                if to_exchange:
+                to_exchange = await _is_solana_exchange_wallet(client, to_wallet)
+                to_pool = to_wallet.lower() in pools
+                if to_exchange or to_pool:
                     unique_sellers.add(from_wallet)
                 else:
                     unique_buyers.add(to_wallet)

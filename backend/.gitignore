@@ -1,0 +1,9 @@
+.env
+.env.*
+.telegram_sessions/
+.venv/
+__pycache__/
+*.pyc
+*.bak
+*.bak-*
+*.bak.*

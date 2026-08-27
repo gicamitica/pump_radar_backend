@@ -35,6 +35,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from server import (  # reuse existing helpers
     get_goplus_security,
     lookup_etherscan_contract_creator,
+    normalize_solana_goplus_safety,
 )
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -50,7 +51,7 @@ CONCURRENCY = 3
 POLL_SECONDS = 15
 
 # chain -> GoPlus platform string (GOPLUS_CHAIN_MAP keys in server.py)
-GOPLUS_PLATFORM = {"eth": "ethereum", "bsc": "binance-smart-chain"}
+GOPLUS_PLATFORM = {"eth": "ethereum", "bsc": "binance-smart-chain", "solana": "solana"}
 # chain -> Etherscan key (server.py ETHERSCAN_API_BY_CHAIN; bsc not yet present)
 ETHERSCAN_CHAIN = {"eth": "eth", "bsc": "bsc"}
 
@@ -70,6 +71,27 @@ def _is1(v):
 
 def _now():
     return datetime.now(timezone.utc)
+
+
+_STABLE_NATIVE_ADDR = {
+    "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT eth
+    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC eth
+    "0x6b175474e89094c44da98b954eedeac495271d0f",  # DAI eth
+    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
+    "0x55d398326f99059ff775485246999027b3197955",  # USDT bsc
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC bsc
+    "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD bsc
+    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB
+    "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c",  # BTCB bsc
+}
+_STABLE_NATIVE_SYM = {"USDT","USDC","DAI","BUSD","WBNB","WETH","BTCB","WSOL","USDC.E","TUSD","FDUSD"}
+
+def _is_stable_or_native(token_addr, symbol):
+    if token_addr and token_addr.lower() in _STABLE_NATIVE_ADDR:
+        return True
+    if symbol and symbol.upper() in _STABLE_NATIVE_SYM:
+        return True
+    return False
 
 
 def score(security_data, has_sec, age_days, prior_rugs):
@@ -171,6 +193,52 @@ def score(security_data, has_sec, age_days, prior_rugs):
     return scores, rec
 
 
+def _score_solana(sec):
+    """Threat/early score din GoPlus Solana (autoritati + concentrare holderi)."""
+    n = normalize_solana_goplus_safety(sec)
+    if not n.get("available"):
+        return None
+    threat = 0; tr = []
+    if n.get("mintable"):
+        threat += 35; tr.append("mint authority activa")
+    if n.get("freezable"):
+        threat += 30; tr.append("freeze authority activa")
+    if n.get("closable") or n.get("balance_mutable_authority"):
+        threat += 25; tr.append("control pe balante/cont")
+    if n.get("metadata_mutable"):
+        threat += 10; tr.append("metadata mutabila")
+    thp = n.get("top_holder_percent")
+    if thp is not None and thp >= 0.30:
+        threat += 15; tr.append("concentrare mare top holder")
+    hc = n.get("holder_count")
+    if hc is not None and hc < 100:
+        threat += 10; tr.append("sub 100 holderi")
+    threat = min(threat, 100)
+    tlabel = "scam_likely" if threat >= 60 else "suspicious" if threat >= 30 else "clean"
+    early = 50; er = []
+    if n.get("trusted_token"):
+        early += 20; er.append("trusted token")
+    if not n.get("safety_red_flags"):
+        early += 15; er.append("fara red flags")
+    early = max(0, min(early, 100 - threat))
+    if early < 50 and not er:
+        er.append("plafonat de risc")
+    elabel = "early_strong" if early >= 75 else "early_watch" if early >= 60 else "early_weak"
+    scores = {
+        "early": {"score": early, "label": elabel, "reasons": er, "computed_at": _now()},
+        "threat": {"score": threat, "label": tlabel, "reasons": tr, "computed_at": _now()},
+    }
+    if threat >= 60:
+        rec = {"verdict": "AVOID", "icon": "red", "summary": "scam likely"}
+    elif early >= 75 and threat < 25:
+        rec = {"verdict": "WATCH", "icon": "green", "summary": "potential early"}
+    elif early >= 60 and threat < 45:
+        rec = {"verdict": "CAUTION", "icon": "yellow", "summary": "interesant dar verifica manual"}
+    else:
+        rec = {"verdict": "SKIP", "icon": "white", "summary": "nimic special"}
+    return scores, rec
+
+
 async def enrich_one(coll, doc):
     chain = doc["chain"]
     token = doc["token_address"]
@@ -208,7 +276,43 @@ async def enrich_one(coll, doc):
             )
             prior_rugs = len(rugged)
 
-    scores, rec = score(sd, has_sec, age_days, prior_rugs)
+    _sol = _score_solana(sec) if chain == "solana" else None
+    if _sol is not None:
+        scores, rec = _sol
+    else:
+        scores, rec = score(sd, has_sec, age_days, prior_rugs)
+    if _is_stable_or_native(token, sd.get("token_symbol")):
+        scores["early"] = {"score": 0, "label": "not_early", "reasons": ["stablecoin/native, not an early play"], "computed_at": _now()}
+        rec = {"verdict": "SKIP", "icon": "white", "summary": "stablecoin / native"}
+    else:
+        _resv = None
+        _g = doc.get("gecko") or {}
+        try:
+            _resv = float(_g.get("reserve_usd")) if _g.get("reserve_usd") is not None else None
+        except (TypeError, ValueError):
+            _resv = None
+        _e = scores["early"]["score"]
+        _er = scores["early"].get("reasons", [])
+        if _resv is None:
+            _e -= 20; _er.append("fara date de lichiditate")
+        elif _resv < 5000:
+            _e -= 30; _er.append(f"lichiditate firava (${_resv:.0f})")
+        elif _resv < 20000:
+            _e -= 15; _er.append(f"lichiditate redusa (${_resv:.0f})")
+        elif _resv >= 50000:
+            _er.append(f"lichiditate solida (${_resv:.0f})")
+        _e = max(0, min(_e, 100))
+        scores["early"]["score"] = _e
+        scores["early"]["reasons"] = _er
+        scores["early"]["label"] = "early_strong" if _e >= 75 else "early_watch" if _e >= 60 else "early_weak"
+        _threat = scores["threat"]["score"]
+        if not (rec.get("verdict") in ("HONEYPOT","AVOID","NO_DATA")):
+            if _e >= 75 and _threat < 25:
+                rec = {"verdict": "WATCH", "icon": "green", "summary": "potential early"}
+            elif _e >= 60 and _threat < 45:
+                rec = {"verdict": "CAUTION", "icon": "yellow", "summary": "interesant dar verifica manual"}
+            else:
+                rec = {"verdict": "SKIP", "icon": "white", "summary": "nimic special"}
 
     enrichment = {
         "deployer": {

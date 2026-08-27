@@ -34,6 +34,15 @@ async def run_full_scan(db) -> Dict:
         enriched = await enrich_all_candidates(candidates, trending)
         logger.info(f"Candidati enriched: {len(enriched)}")
 
+        # Dune on-chain validation layer (isolated module, non-fatal on failure)
+        try:
+            from dune_enrichment import enrich_batch
+            import asyncio as _aio
+            loop = _aio.get_event_loop()
+            enriched = await loop.run_in_executor(None, enrich_batch, enriched)
+        except Exception as _dune_exc:
+            logger.warning(f"dune_enrichment skipped: {_dune_exc}")
+
         if not enriched:
             logger.warning("Niciun candidat enriched - scan oprit")
             return {"success": False, "reason": "no_enriched_candidates"}
@@ -83,12 +92,39 @@ async def run_full_scan(db) -> Dict:
                 f"New architecture scan: {len(pump_signals)} pump, "
                 f"{len(dump_signals)} dump, {len(risk_signals)} risk, "
                 f"{len(watch_signals)} watch, {len(dex_signals)} dex, "
-                f"{len(early_signals)} early signals din {len(enriched)} candidati."
+                f"{len(early_signals)} early signals from {len(enriched)} candidates."
             ),
         }
 
         await db.signal_snapshots_v2.insert_one(snapshot)
         logger.info("Snapshot salvat in MongoDB (signal_snapshots_v2)")
+        try:
+            now = datetime.utcnow() if "datetime" in dir() else __import__("datetime").datetime.utcnow()
+            for sig in (pump_signals + early_signals):
+                addr, net = sig.get("token_address"), sig.get("network")
+                price = sig.get("price_usd")
+                if not addr or not net or not price or price <= 0:
+                    continue
+                if net == "unknown" or addr in ("0", ""):
+                    continue
+                await db.signal_performance.insert_one({
+                    "token_address": addr,
+                    "network": net,
+                    "symbol": sig.get("symbol"),
+                    "category": sig.get("category"),
+                    "verdict": sig.get("verdict"),
+                    "confidence": sig.get("confidence"),
+                    "reason": sig.get("reason"),
+                    "pool_url": sig.get("pool_url"),
+                    "detect_price": price,
+                    "detect_liquidity": sig.get("reserve_usd") or 0,
+                    "detected_at": now,
+                    "price_1h": None, "price_4h": None, "price_24h": None,
+                    "checked_1h": False, "checked_4h": False, "checked_24h": False,
+                })
+            logger.info("Forward-tracker: semnale inregistrate in signal_performance")
+        except Exception as e:
+            logger.error(f"Forward-tracker error: {e}", exc_info=True)
         try:
             from email_alerts import send_signal_alert_emails
             all_signals = pump_signals + dump_signals + risk_signals + early_signals

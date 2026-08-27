@@ -29,8 +29,8 @@ load_dotenv()
 from fastapi import FastAPI, HTTPException, Depends, status, Request, Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr, Field
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from passlib.context import CryptContext
@@ -68,6 +68,8 @@ STRIPE_API_KEY = os.environ["STRIPE_API_KEY"]
 APP_URL = os.environ.get("APP_URL", "http://localhost:3000")
 LOGO_URL = f"{APP_URL}/logo-pumpradar.png"
 TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CALLS_CHANNEL = os.environ.get("TELEGRAM_CALLS_CHANNEL", "").strip()
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
 TELEGRAM_PHONE = os.environ.get("TELEGRAM_PHONE", "").strip()
 TELEGRAM_SESSION_NAME = os.environ.get("TELEGRAM_SESSION_NAME", "pumpradar-telegram").strip() or "pumpradar-telegram"
@@ -329,6 +331,18 @@ db = client[DB_NAME]
 from onchain_routes import router as onchain_router, set_db as _set_onchain_db
 _set_onchain_db(db)
 app.include_router(onchain_router)
+
+# --- funding tracing (ETH gas source) - isolated module ---
+from funding_routes import router as funding_router
+app.include_router(funding_router)
+from whale_movements import router as whale_mvmt_router
+app.include_router(whale_mvmt_router)
+from dune_routes import router as dune_router
+app.include_router(dune_router)
+from rug_check import router as rug_check_router
+app.include_router(rug_check_router)
+from whale_alerts_job import router as whale_alerts_router
+app.include_router(whale_alerts_router)
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer = HTTPBearer(auto_error=False)
@@ -730,9 +744,23 @@ class LoginDTO(BaseModel):
 
 class RegisterDTO(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(..., min_length=8)
     name: str
     confirmPassword: Optional[str] = None
+    ref: Optional[str] = None
+
+    @field_validator("password")
+    @classmethod
+    def _pw_complexity(cls, v):
+        if not any(c.isalpha() for c in v) or not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain at least one letter and one number")
+        return v
+
+    @model_validator(mode="after")
+    def _pw_match(self):
+        if self.confirmPassword is not None and self.confirmPassword != self.password:
+            raise ValueError("Passwords do not match")
+        return self
 
 class ForgotPasswordDTO(BaseModel):
     email: EmailStr
@@ -776,6 +804,7 @@ async def register(dto: RegisterDTO):
         "subscription": "free",
         "subscription_expiry": None,
         "created_at": datetime.now(timezone.utc),
+        "referred_by": (dto.ref or "").strip() or None,
     }
     result = await db.users.insert_one(user_doc)
     user_doc["_id"] = result.inserted_id
@@ -985,27 +1014,28 @@ async def super_admin_me(admin=Depends(get_current_super_admin)):
 # GOOGLE OAUTH
 # ─────────────────────────────────────────────
 # Google OAuth session verification endpoint
-GOOGLE_AUTH_URL = "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data"
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
 class GoogleAuthDTO(BaseModel):
-    session_id: str
+    credential: str
 
 @app.post("/api/auth/google")
 async def google_auth(dto: GoogleAuthDTO, response: Response):
     """Exchange Google OAuth session_id for user session"""
     try:
-        # Call Google Auth to get user data
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                GOOGLE_AUTH_URL,
-                headers={"X-Session-ID": dto.session_id},
-                timeout=10.0
+        # Verify Google ID token (GIS flow)
+        from google.oauth2 import id_token as _google_id_token
+        from google.auth.transport import requests as _google_requests
+        try:
+            google_data = await asyncio.to_thread(
+                _google_id_token.verify_oauth2_token,
+                dto.credential,
+                _google_requests.Request(),
+                GOOGLE_CLIENT_ID,
             )
-            if resp.status_code != 200:
-                logger.error(f"Google Auth error: {resp.status_code} - {resp.text}")
-                raise HTTPException(status_code=401, detail=api_err("Google authentication failed", "GOOGLE_AUTH_FAILED"))
-            
-            google_data = resp.json()
+        except ValueError as _ve:
+            logger.error(f"Google token verify failed: {_ve}")
+            raise HTTPException(status_code=401, detail=api_err("Google authentication failed", "GOOGLE_AUTH_FAILED"))
         
         email = google_data.get("email", "").lower()
         name = google_data.get("name", "")
@@ -7454,6 +7484,29 @@ async def stripe_webhook(request: Request):
                         subscription_id=subscription_id,
                         trigger_email=True,
                     )
+                    # Affiliate commission (Faza 2): 30% recurent daca userul a fost referit
+                    try:
+                        user = await db.users.find_one({"_id": ObjectId(tx["user_id"])})
+                        ref = (user or {}).get("referred_by")
+                        if ref:
+                            amount_paid = invoice.get("amount_paid") if isinstance(invoice, dict) else getattr(invoice, "amount_paid", 0)
+                            amount_usd = (amount_paid or 0) / 100.0
+                            commission = round(amount_usd * 0.30, 2)
+                            if commission > 0:
+                                await db.affiliate_commissions.insert_one({
+                                    "affiliate_code": ref,
+                                    "user_id": str(tx["user_id"]),
+                                    "user_email": (user or {}).get("email"),
+                                    "subscription_id": subscription_id,
+                                    "amount_paid_usd": round(amount_usd, 2),
+                                    "commission_usd": commission,
+                                    "rate": 0.30,
+                                    "status": "pending",
+                                    "created_at": datetime.utcnow(),
+                                })
+                                logger.info(f"Affiliate commission: {ref} +${commission} (user {tx['user_id']})")
+                    except Exception as e:
+                        logger.error(f"Affiliate commission error: {e}", exc_info=True)
 
         if event_type == "customer.subscription.deleted":
             subscription = event.get("data", {}).get("object", {}) if isinstance(event, dict) else event.data.object
@@ -7546,13 +7599,10 @@ async def startup_event():
     scheduler.add_job(track_signal_accuracy, 'interval', hours=2, id='accuracy_tracker', replace_existing=True)
     scheduler.add_job(send_trial_reminder_emails, 'interval', hours=1, id='trial_reminder_emails', replace_existing=True)
     scheduler.add_job(evaluate_pending_telegram_signals, 'interval', minutes=15, id='telegram_signal_verifier', replace_existing=True)
-    
-    # Market open emails (PRO feature)
-    # London Stock Exchange opens at 08:00 UTC
-    scheduler.add_job(send_london_market_email, 'cron', hour=8, minute=0, id='london_market_email', replace_existing=True)
-    
-    # New York Stock Exchange opens at 14:30 UTC (9:30 AM EST)
-    scheduler.add_job(send_nyse_market_email, 'cron', hour=14, minute=30, id='nyse_market_email', replace_existing=True)
+    scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(update_signal_performance(), _main_loop), 'interval', minutes=15, id='signal_perf_tracker', replace_existing=True)
+    scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(post_watch_signals_to_telegram(), _main_loop), 'interval', minutes=20, id='telegram_watch_poster', replace_existing=True)
+    from whale_alerts_job import run_whale_alert_scan
+    scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(run_whale_alert_scan(db), _main_loop), 'cron', minute=20, id='whale_alerts_scan', replace_existing=True)
     
     scheduler.start()
     
@@ -7614,9 +7664,20 @@ class ChatRequest(BaseModel):
     message: str
     history: Optional[List[dict]] = []
 
+import time as _ai_time
+_AI_CALLS: dict = {}
+def _check_ai_rate_limit(key, max_calls=20, window_sec=300):
+    now = _ai_time.time()
+    calls = [t for t in _AI_CALLS.get(key, []) if now - t < window_sec]
+    if len(calls) >= max_calls:
+        raise HTTPException(status_code=429, detail=api_err("Rate limit exceeded. Please slow down.", "RATE_LIMIT"))
+    calls.append(now)
+    _AI_CALLS[key] = calls
+
 @app.post("/api/ai/chat")
 async def ai_chat(req: ChatRequest, user=Depends(require_active_subscription)):
     """AI customer service chat powered by Gemini - Smart & Helpful"""
+    _check_ai_rate_limit(f"chat:{user['_id']}", max_calls=20, window_sec=300)
     try:
         # Get latest signal context with details
         snapshot = await db.signal_snapshots.find_one({}, sort=[("timestamp", -1)])
@@ -13982,7 +14043,7 @@ def lookup_honeypot_holders_osint(chain: str, contract: str):
 
 
 @app.post("/api/osint/scan")
-async def token_osint_scan(payload: TokenOsintScanRequest, user=Depends(get_optional_user)):
+async def token_osint_scan(payload: TokenOsintScanRequest, user=Depends(require_active_subscription)):
     query = payload.query.strip()
 
     if not query:
@@ -14506,7 +14567,7 @@ def build_osint_email_report_html(scan_result: dict, analysis: dict, user_email:
 
 
 @app.post("/api/osint/email-report/{scan_id}")
-async def token_osint_email_report(scan_id: str, user=Depends(get_current_user)):
+async def token_osint_email_report(scan_id: str, user=Depends(require_active_subscription)):
     try:
         doc = await db.osint_scans.find_one({
             "_id": ObjectId(scan_id),
@@ -14566,7 +14627,7 @@ async def token_osint_email_report(scan_id: str, user=Depends(get_current_user))
 
 
 @app.post("/api/osint/analyze/{scan_id}")
-async def token_osint_full_ai_analysis(scan_id: str, user=Depends(get_current_user)):
+async def token_osint_full_ai_analysis(scan_id: str, user=Depends(require_active_subscription)):
     try:
         doc = await db.osint_scans.find_one({
             "_id": ObjectId(scan_id),
@@ -14597,7 +14658,7 @@ async def token_osint_full_ai_analysis(scan_id: str, user=Depends(get_current_us
 
 
 @app.get("/api/osint/history")
-async def token_osint_history(limit: int = 25, user=Depends(get_current_user)):
+async def token_osint_history(limit: int = 25, user=Depends(require_active_subscription)):
     limit = max(1, min(int(limit or 25), 100))
 
     docs = await db.osint_scans.find({
@@ -14632,7 +14693,7 @@ async def token_osint_history(limit: int = 25, user=Depends(get_current_user)):
 
 
 @app.get("/api/osint/history/{scan_id}")
-async def token_osint_history_detail(scan_id: str, user=Depends(get_current_user)):
+async def token_osint_history_detail(scan_id: str, user=Depends(require_active_subscription)):
     try:
         doc = await db.osint_scans.find_one({
             "_id": ObjectId(scan_id),
@@ -15165,14 +15226,14 @@ def _osint_resolve_token(query: str) -> dict:
 
 
 @app.get("/api/crypto/osint-resolve/{query}")
-async def osint_resolve(query: str):
+async def osint_resolve(query: str, user=Depends(require_active_subscription)):
     """Rezolva orice symbol/coin -> chain+address via CoinGecko (pt tokenuri din afara snapshotului)."""
     res = await asyncio.to_thread(_osint_resolve_token, query)
     return api_ok(res)
 
 
 @app.get("/api/crypto/osint/{chain}/{address}")
-async def get_osint_overview(chain: str, address: str):
+async def get_osint_overview(chain: str, address: str, user=Depends(require_active_subscription)):
     """OSINT Lab Faza 1: agregare read-only (snapshot v2 + holders Moralis).
     NU atinge scanner/judge/categorii - doar citeste si combina."""
     addr = (address or "").strip()
@@ -15405,6 +15466,65 @@ async def get_osint_overview(chain: str, address: str):
 
 
 
+@app.get("/api/crypto/osint-report/{chain}/{address}")
+async def get_osint_report_pdf(chain: str, address: str, user=Depends(require_active_subscription)):
+    """OSINT PDF Report (Pro-only). Generates a 2-page branded PDF from OSINT data."""
+    from io import BytesIO
+    from osint_pdf import build_osint_pdf
+    from datetime import datetime, timezone
+
+    # Reuse get_osint_overview logic to get the data
+    addr = (address or "").strip()
+    addr_l = addr.lower()
+    ch = (chain or "").lower().strip()
+    sig = None
+    snap = await get_latest_snapshot(db)
+    if snap:
+        for cat in ("pump_signals", "dump_signals", "risk_signals",
+                    "watch_signals", "dex_signals", "early_signals"):
+            for s in (snap.get(cat) or []):
+                ta = (s.get("token_address") or "").lower()
+                sym = (s.get("symbol") or "").lower()
+                if (addr_l and ta == addr_l) or (sym and sym == addr_l):
+                    sig = s
+                    break
+            if sig:
+                break
+    # Get full OSINT overview via the existing endpoint function
+    overview_response = await get_osint_overview(chain, address, user)
+    osint_data = overview_response.get("data") if isinstance(overview_response, dict) else None
+    if not osint_data:
+        raise HTTPException(status_code=404, detail="OSINT data not available")
+
+    email = user.get("email") if isinstance(user, dict) else None
+    try:
+        pdf_bytes = await asyncio.to_thread(build_osint_pdf, osint_data, email)
+    except Exception as e:
+        logger.error(f"PDF generation failed for {chain}/{address}: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
+
+    # Log download
+    try:
+        await db.pdf_reports_log.insert_one({
+            "user_email": email,
+            "user_id": user.get("_id") if isinstance(user, dict) else None,
+            "chain": chain,
+            "address": address,
+            "symbol": (osint_data.get("token") or {}).get("symbol"),
+            "size_bytes": len(pdf_bytes),
+            "timestamp": datetime.now(timezone.utc),
+        })
+    except Exception as e:
+        logger.warning(f"pdf_reports_log insert failed: {e}")
+
+    symbol = (osint_data.get("token") or {}).get("symbol") or "TOKEN"
+    filename = f"PumpRadar_{symbol}_OSINT_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.pdf"
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 @app.post("/api/admin/trigger-scan-v2")
 async def trigger_scan_v2(request: Request):
     """Trigger scan nou arhitectura v2 - localhost only"""
@@ -15413,6 +15533,276 @@ async def trigger_scan_v2(request: Request):
         return api_err("Forbidden", "FORBIDDEN")
     asyncio.create_task(run_full_scan(db))
     return api_ok({"started": True, "message": "Scan v2 triggered"})
+
+async def update_signal_performance():
+    """Forward-tracker v2: preturi live GeckoTerminal per token (nu snapshot map).
+    Fix: snapshot price_map producea coliziuni/preturi gresite (ex JUP price_4h=998).
+    Sanity check: skip daca pretul difera >10x de detect_price (marcat suspect)."""
+    try:
+        now = datetime.utcnow()
+        windows = [("1h", 1, "checked_1h", "price_1h"),
+                   ("4h", 4, "checked_4h", "price_4h"),
+                   ("24h", 24, "checked_24h", "price_24h")]
+        pending = await db.signal_performance.find({
+            "$or": [{"checked_1h": False}, {"checked_4h": False}, {"checked_24h": False}]
+        }).to_list(length=5000)
+
+        # Grupez pe token unic ca sa fac 1 fetch Gecko per token, nu per record
+        need_price = {}
+        for rec in pending:
+            det = rec.get("detected_at")
+            if not det:
+                continue
+            age_h = (now - det).total_seconds() / 3600
+            for label, hrs, checked_f, price_f in windows:
+                if not rec.get(checked_f) and age_h >= hrs:
+                    key = f"{rec.get('network')}:{rec.get('token_address')}"
+                    need_price[key] = (rec.get("network"), rec.get("token_address"))
+                    break
+
+        # Fetch live price per token (max 30 tokens/run, throttled)
+        gecko_net_map = {"eth": "eth", "solana": "solana", "bsc": "bsc", "base": "base", "arbitrum": "arbitrum_one"}
+        live_prices = {}
+        fetched = 0
+        for key, (net, addr) in need_price.items():
+            if fetched >= 30:
+                break
+            gnet = gecko_net_map.get((net or "").lower())
+            if not gnet or not addr:
+                continue
+            try:
+                def _req(gn=gnet, ad=addr):
+                    return requests.get(
+                        f"https://api.geckoterminal.com/api/v2/networks/{gn}/tokens/{ad}",
+                        timeout=10,
+                    )
+                resp = await asyncio.to_thread(_req)
+                if resp.status_code == 200:
+                    p = resp.json().get("data", {}).get("attributes", {}).get("price_usd")
+                    if p is not None:
+                        live_prices[key] = float(p)
+                fetched += 1
+                await asyncio.sleep(0.5)  # throttle Gecko
+            except Exception:
+                continue
+
+        updated = 0
+        suspect = 0
+        for rec in pending:
+            key = f"{rec.get('network')}:{rec.get('token_address')}"
+            cur = live_prices.get(key)
+            det = rec.get("detected_at")
+            if not det:
+                continue
+            age_h = (now - det).total_seconds() / 3600
+            detect_p = rec.get("detect_price") or 0
+            sets = {}
+            for label, hrs, checked_f, price_f in windows:
+                if not rec.get(checked_f) and age_h >= hrs:
+                    if cur is not None:
+                        # Sanity: pret >10x diferit de detect = suspect, nu-l scriu
+                        if detect_p > 0 and (cur > detect_p * 10 or cur < detect_p / 10):
+                            sets["suspect_price"] = cur
+                            sets[checked_f] = True
+                            suspect += 1
+                        else:
+                            sets[price_f] = cur
+                            sets[checked_f] = True
+                    else:
+                        sets[checked_f] = True
+            if sets:
+                await db.signal_performance.update_one({"_id": rec["_id"]}, {"$set": sets})
+                updated += 1
+        if updated:
+            logger.info(f"Forward-tracker v2: {updated} actualizate, {suspect} preturi suspecte ignorate")
+    except Exception as e:
+        logger.error(f"update_signal_performance error: {e}", exc_info=True)
+
+
+def _tg_net_emoji(net: str) -> str:
+    return {
+        "eth": "\U0001F537", "ethereum": "\U0001F537",
+        "solana": "\U0001F7E3", "bsc": "\U0001F7E1",
+        "base": "\U0001F535", "arbitrum": "\U0001F4D8",
+        "cex": "\U0001F3E6",
+    }.get((net or "").lower(), "\U0001F4CD")
+
+def _tg_conf_bar(conf: int) -> str:
+    filled = max(0, min(10, round((conf or 0) / 10)))
+    return "\u25B0" * filled + "\u25B1" * (10 - filled)
+
+def _tg_fmt_usd(v) -> str:
+    if not v:
+        return "n/a"
+    v = float(v)
+    if v >= 1_000_000:
+        return f"${v/1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"${v/1_000:.0f}K"
+    if v >= 1:
+        return f"${v:,.2f}"
+    return f"${v:.8f}".rstrip("0").rstrip(".")
+
+def _tg_esc(t: str) -> str:
+    return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+async def post_watch_signals_to_telegram():
+    """Posteaza WATCH-uri noi in canalul public Telegram, cu dedup in Mongo."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CALLS_CHANNEL:
+        return
+    try:
+        snap = await db.signal_snapshots_v2.find_one({}, sort=[("timestamp", -1)])
+        if not snap:
+            return
+        watch = snap.get("watch_signals") or []
+        if not watch:
+            return
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        posted = 0
+        async with httpx.AsyncClient(timeout=15) as client:
+            for sig in watch:
+                addr, net = sig.get("token_address"), sig.get("network")
+                if not addr or not net or net == "unknown" or addr in ("0", ""):
+                    continue
+                net_norm = "eth" if (net or "").lower() in ("ethereum",) else (net or "").lower()
+                key = f"{net_norm}:{addr}"
+                if await db.telegram_posted_calls.find_one({"_id": key}):
+                    continue
+
+                sym = _tg_esc(sig.get("symbol", "?"))
+                conf = sig.get("confidence", 0)
+                verdict = _tg_esc(sig.get("verdict", "Watch Setup"))
+                reason = _tg_esc((sig.get("reason") or "")[:200])
+                pool_url = sig.get("pool_url", "")
+                net_label = (net or "").upper()
+                emoji = _tg_net_emoji(net)
+                bar = _tg_conf_bar(conf)
+
+                price_str = _tg_fmt_usd(sig.get("price_usd"))
+                liq_str = _tg_fmt_usd(sig.get("reserve_usd"))
+                vol_str = _tg_fmt_usd(sig.get("volume_h24"))
+                h1 = sig.get("price_change_h1")
+                h24 = sig.get("price_change_h24")
+                h1_str = f"{h1:+.1f}%" if isinstance(h1, (int, float)) else "n/a"
+                h24_str = f"{h24:+.1f}%" if isinstance(h24, (int, float)) else "n/a"
+
+                text = (
+                    f"<b>${sym}</b> \u00B7 {net_label}\n"
+                    f"{verdict} \u00B7 Confidence {conf}/100\n\n"
+                    f"Price: {price_str}\n"
+                    f"Liquidity: {liq_str}\n"
+                    f"24h volume: {vol_str}\n"
+                    f"1h / 24h: {h1_str} / {h24_str}\n\n"
+                    f"{reason}\n\n"
+                    f"<a href=\"{pool_url}\">Chart</a> \u00B7 "
+                    f"<a href=\"https://pump.arbitrajz.com\">Live signals</a>"
+                )
+                r = await client.post(url, data={
+                    "chat_id": TELEGRAM_CALLS_CHANNEL,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": "true",
+                })
+                if r.status_code == 200 and r.json().get("ok"):
+                    await db.telegram_posted_calls.insert_one({
+                        "_id": key, "symbol": sym,
+                        "posted_at": datetime.utcnow(),
+                    })
+                    posted += 1
+                    await asyncio.sleep(1.5)
+        if posted:
+            logger.info(f"Telegram: {posted} WATCH-uri postate in canal")
+    except Exception as e:
+        logger.error(f"post_watch_signals_to_telegram error: {e}", exc_info=True)
+
+
+@app.get("/api/crypto/track-record")
+async def get_track_record(limit: int = 20, min_liquidity: float = 10000, max_gain: float = 3000, user=Depends(get_optional_user)):
+    """Public track record: best pump/early meme calls from signal_snapshots_v2.
+    Filters ghost pools by reserve_usd and corrupt data; dedups per ticker."""
+    snapshots = await db.signal_snapshots_v2.find({}).sort("timestamp", 1).to_list(length=2000)
+
+    history, appearances = {}, {}
+    for snap in snapshots:
+        ts = snap.get("timestamp")
+        for sig in (snap.get("all_signals") or []):
+            addr, net = sig.get("token_address"), sig.get("network")
+            if not addr or not net:
+                continue
+            if net in ("unknown",) or addr in ("0", "", None):
+                continue
+            net_norm = "eth" if (net or "").lower() in ("ethereum",) else (net or "").lower()
+            key = f"{net_norm}:{addr}"
+            history.setdefault(key, []).append((ts, sig))
+            appearances[key] = appearances.get(key, 0) + 1
+
+    results = []
+    for key, entries in history.items():
+        first_idx = None
+        for idx, (ts, sig) in enumerate(entries):
+            if sig.get("category") in ("pump", "early"):
+                first_idx = idx
+                break
+        if first_idx is None:
+            continue
+        if appearances[key] > 20:
+            continue
+
+        detect_ts, detect_sig = entries[first_idx]
+        detect_price = detect_sig.get("price_usd")
+        if not detect_price or detect_price <= 0:
+            continue
+
+        detect_liq = detect_sig.get("reserve_usd") or 0
+        if detect_liq < min_liquidity:
+            continue
+
+        peak_price, peak_ts = detect_price, detect_ts
+        for ts, sig in entries[first_idx + 1:]:
+            p = sig.get("price_usd")
+            if p and p > peak_price:
+                peak_price, peak_ts = p, ts
+
+        gain_pct = round((peak_price - detect_price) / detect_price * 100, 2)
+        if gain_pct > max_gain:
+            continue
+        hours_to_peak = round((peak_ts - detect_ts).total_seconds() / 3600, 1) if peak_ts != detect_ts else 0
+
+        results.append({
+            "symbol": detect_sig.get("symbol"),
+            "name": detect_sig.get("name"),
+            "network": detect_sig.get("network"),
+            "category": detect_sig.get("category"),
+            "verdict": detect_sig.get("verdict"),
+            "confidence": detect_sig.get("confidence"),
+            "reason": detect_sig.get("reason"),
+            "token_address": detect_sig.get("token_address"),
+            "pool_url": detect_sig.get("pool_url"),
+            "detected_at": detect_ts.isoformat() if hasattr(detect_ts, "isoformat") else detect_ts,
+            "detect_price": detect_price,
+            "detect_liquidity": detect_liq,
+            "peak_price": peak_price,
+            "peak_gain_pct": gain_pct,
+            "hours_to_peak": hours_to_peak,
+            "appearances": appearances[key],
+        })
+
+    best_by_symbol = {}
+    for r in results:
+        sym = r["symbol"]
+        if sym not in best_by_symbol or r["peak_gain_pct"] > best_by_symbol[sym]["peak_gain_pct"]:
+            best_by_symbol[sym] = r
+
+    deduped = list(best_by_symbol.values())
+    deduped.sort(key=lambda r: r["peak_gain_pct"], reverse=True)
+    return api_ok({
+        "calls": deduped[:limit],
+        "total_tracked": len(deduped),
+        "min_liquidity": min_liquidity,
+        "max_gain": max_gain,
+        "generated_at": datetime.utcnow().isoformat(),
+    })
+
 
 @app.get("/api/crypto/signals-v2")
 async def get_signals_v2(user=Depends(get_optional_user)):
@@ -15441,7 +15831,9 @@ async def get_signals_v2(user=Depends(get_optional_user)):
 
 
 @app.post("/api/crypto/ai-market-analysis")
-async def ai_market_analysis(request: Request):
+async def ai_market_analysis(request: Request, user=Depends(require_active_subscription)):
+    _rl_ip = (request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown"))
+    _check_ai_rate_limit(f"analysis:{_rl_ip}", max_calls=10, window_sec=300)
     try:
         body = await request.json()
         signals_summary = body.get("signals_summary", "")
@@ -15826,3 +16218,806 @@ async def get_token_contract_by_id(coin_id: str):
             return {"contract": None, "chain": None}
     except Exception as e:
         return {"contract": None, "chain": None, "error": str(e)}
+
+
+# ============ SOLBOT ADMIN ENDPOINTS ============
+# Adaugat pentru dashboard /admin/solbot
+# Admin: viorel.mina@gmail.com
+
+SOLBOT_ADMIN_EMAILS = {"viorel.mina@gmail.com"}
+
+
+def _is_solbot_admin(user):
+    if not user:
+        return False
+    email = (user.get("email") or "").lower().strip()
+    return email in SOLBOT_ADMIN_EMAILS
+
+
+def _solbot_db():
+    from pymongo import MongoClient
+    import os
+    uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+    return MongoClient(uri)["pumpradar"]
+
+
+def _solbot_require_admin(current_user=Depends(get_current_user)):
+    if not _is_solbot_admin(current_user):
+        raise HTTPException(status_code=403, detail="Solbot admin only")
+    return current_user
+
+
+def _get_runtime_config():
+    """Citeste solbot_runtime_config din Mongo, cu defaults."""
+    DEFAULTS = {
+        "enabled": True, "capital_usd": 100, "risk_per_trade_pct": 25,
+        "max_concurrent_trades": 3, "stop_loss_pct": 5,
+        "trail_activation_pct": 5, "trail_giveback_pct": 2,
+        "max_hold_minutes": 60,
+        "min_conf_pumpradar": 65, "min_conf_dexscreener_boost": 68,
+        "min_conf_ds_top_boost": 72, "min_conf_ds_profile": 68,
+        "min_helius_wallets": 15,
+    }
+    db = _solbot_db()
+    doc = db["solbot_runtime_config"].find_one({"_id": "current"}) or {}
+    merged = dict(DEFAULTS)
+    merged.update({k: v for k, v in doc.items() if k != "_id"})
+    return merged
+
+
+def _solbot_progressive_status(db, now):
+    """Calculeaza read-only registrul progresiv pentru dashboard."""
+    import math
+
+    try:
+        cfg = _get_runtime_config()
+        state = db["solbot_capital_state"].find_one(
+            {"_id": "paper_progressive_v1"}
+        )
+
+        destination = str(
+            cfg.get("withdrawal_destination") or ""
+        ).strip()
+        masked_destination = (
+            f"{destination[:8]}...{destination[-8:]}"
+            if len(destination) > 16
+            else destination or None
+        )
+        withdrawal = {
+            "mode": str(
+                cfg.get("withdrawal_mode") or "disabled"
+            ).lower(),
+            "destination_configured": bool(destination),
+            "destination": masked_destination,
+            "live_transfers_supported": False,
+        }
+
+        if not state or state.get("status") != "active":
+            return {
+                "available": False,
+                "reason": "capital_state_not_initialized",
+                "position_sizing_mode": str(
+                    cfg.get("position_sizing_mode") or "fixed"
+                ).lower(),
+                "withdrawal": withdrawal,
+            }
+
+        def number(key, default):
+            value = cfg.get(key, default)
+            if value is None:
+                value = default
+            return float(value)
+
+        started_at = state["started_at"]
+        base_capital = float(state["base_capital_usd"])
+        reinvest_pct = number(
+            "progressive_reinvest_profit_pct",
+            50,
+        )
+        position_pct = number(
+            "progressive_position_pct",
+            10,
+        )
+        min_position = number(
+            "progressive_min_position_usd",
+            5,
+        )
+        max_position = number(
+            "progressive_max_position_usd",
+            25,
+        )
+        daily_loss_limit = number(
+            "progressive_daily_loss_limit_usd",
+            10,
+        )
+
+        closed = list(
+            db["solbot_trades"]
+            .find(
+                {
+                    "paper": True,
+                    "status": "closed",
+                    "closed_at": {"$gte": started_at},
+                    "excluded_from_stats": {"$ne": True},
+                },
+                {
+                    "pnl_usd": 1,
+                    "closed_at": 1,
+                },
+            )
+            .sort([("closed_at", 1), ("_id", 1)])
+        )
+
+        trading = base_capital
+        reserve = 0.0
+        profit = 0.0
+        loss = 0.0
+        wins = 0
+        losses = 0
+        breakeven = 0
+        reinvest_ratio = reinvest_pct / 100
+        for trade in closed:
+            pnl = float(trade.get("pnl_usd") or 0)
+            if pnl > 0:
+                wins += 1
+                profit += pnl
+                trading += pnl * reinvest_ratio
+                reserve += pnl * (1 - reinvest_ratio)
+            elif pnl < 0:
+                losses += 1
+                loss += pnl
+                trading = max(0.0, trading + pnl)
+            else:
+                breakeven += 1
+
+        open_rows = list(
+            db["solbot_trades"].find(
+                {
+                    "paper": True,
+                    "status": "open",
+                    "opened_at": {"$gte": started_at},
+                },
+                {"size_usd": 1},
+            )
+        )
+        open_exposure = round(
+            sum(
+                float(row.get("size_usd") or 0)
+                for row in open_rows
+            ),
+            2,
+        )
+        available_trading = round(
+            max(0.0, trading - open_exposure),
+            2,
+        )
+
+        nominal_size = trading * position_pct / 100
+        next_size = math.floor(
+            max(
+                0.0,
+                min(
+                    nominal_size,
+                    max_position,
+                    available_trading,
+                ),
+            )
+            * 100
+        ) / 100
+
+        day_start = now.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        daily_start = max(started_at, day_start)
+        daily_pnl = round(
+            sum(
+                float(row.get("pnl_usd") or 0)
+                for row in closed
+                if row.get("closed_at")
+                and row["closed_at"] >= daily_start
+            ),
+            2,
+        )
+
+        blocked_reason = None
+        if daily_pnl <= -daily_loss_limit:
+            blocked_reason = (
+                f"daily_loss_limit ${daily_pnl:.2f} <= "
+                f"-${daily_loss_limit:.2f}"
+            )
+            next_size = 0.0
+        elif available_trading < min_position:
+            blocked_reason = (
+                f"capital disponibil ${available_trading:.2f} "
+                f"sub minim ${min_position:.2f}"
+            )
+            next_size = 0.0
+        elif next_size < min_position:
+            blocked_reason = (
+                f"marime calculata ${next_size:.2f} "
+                f"sub minim ${min_position:.2f}"
+            )
+            next_size = 0.0
+
+        return {
+            "available": True,
+            "version": state.get("version"),
+            "started_at": started_at,
+            "position_sizing_mode": str(
+                cfg.get("position_sizing_mode") or "fixed"
+            ).lower(),
+            "base_capital_usd": round(base_capital, 2),
+            "reinvest_profit_pct": reinvest_pct,
+            "position_pct": position_pct,
+            "min_position_usd": min_position,
+            "max_position_usd": max_position,
+            "daily_loss_limit_usd": daily_loss_limit,
+            "trading_capital_usd": round(trading, 2),
+            "vault_reserve_usd": round(reserve, 2),
+            "total_virtual_capital_usd": round(
+                trading + reserve,
+                2,
+            ),
+            "realized_profit_usd": round(profit, 2),
+            "realized_loss_usd": round(loss, 2),
+            "realized_net_usd": round(profit + loss, 2),
+            "closed_wins": wins,
+            "closed_losses": losses,
+            "closed_breakeven": breakeven,
+            "closed_count": len(closed),
+            "open_positions": len(open_rows),
+            "open_exposure_usd": open_exposure,
+            "available_trading_usd": available_trading,
+            "daily_pnl_usd": daily_pnl,
+            "blocked": blocked_reason is not None,
+            "blocked_reason": blocked_reason,
+            "next_position_size_usd": next_size,
+            "withdrawal": withdrawal,
+            "computed_at": now,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": "progressive_status_error",
+            "error": str(exc)[:200],
+        }
+
+
+@app.get("/api/solbot/stats")
+async def solbot_stats(current_user=Depends(_solbot_require_admin)):
+    from datetime import datetime, timedelta
+    db = _solbot_db()
+    now = datetime.utcnow()
+
+    open_trades = list(db["solbot_trades"].find({
+        "status": "open",
+        "paper": True,
+        "excluded_from_analytics": {"$ne": True},
+        "data_valid": {"$ne": False},
+    }))
+    for t in open_trades:
+        for k, v in list(t.items()):
+            if type(v).__name__ == "ObjectId":
+                t[k] = str(v)
+        t["held_min"] = round((now - t["opened_at"]).total_seconds() / 60, 1)
+
+    week_ago = now - timedelta(days=7)
+    closed = list(db["solbot_trades"].find({
+        "status": "closed",
+        "paper": True,
+        "closed_at": {"$gte": week_ago},
+        "excluded_from_analytics": {"$ne": True},
+        "data_valid": {"$ne": False},
+    }).sort("closed_at", -1))
+    for t in closed:
+        for k, v in list(t.items()):
+            if type(v).__name__ == "ObjectId":
+                t[k] = str(v)
+
+    total_pnl = sum(t.get("pnl_usd") or 0 for t in closed)
+    wins = [t for t in closed if (t.get("pnl_pct") or 0) > 0]
+    losses = [t for t in closed if (t.get("pnl_pct") or 0) <= 0]
+    win_rate = (len(wins) / len(closed) * 100) if closed else 0
+
+    queue_pending = db["solbot_execution_queue"].count_documents({"status": "pending"})
+    queue_24h = db["solbot_execution_queue"].count_documents({
+        "created_at": {"$gte": now - timedelta(hours=24)}
+    })
+
+    return {
+        "open_trades": open_trades,
+        "recent_closed": closed[:20],
+        "totals": {
+            "total_pnl_usd": round(total_pnl, 2),
+            "trades_7d": len(closed),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate_pct": round(win_rate, 1),
+        },
+        "queue": {"pending": queue_pending, "added_24h": queue_24h},
+        "progressive": _solbot_progressive_status(db, now),
+    }
+
+
+
+# === SOLBOT ANALYTICS READ-ONLY V1 ===
+def _solbot_metrics(trades):
+    """Calculeaza metrici exclusiv din documentele primite. Nu scrie in Mongo."""
+    from datetime import datetime
+
+    ordered = sorted(
+        trades,
+        key=lambda trade: trade.get("closed_at") or datetime.min,
+    )
+
+    def safe_float(value):
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    pnls = [safe_float(trade.get("pnl_usd")) for trade in ordered]
+    wins = [pnl for pnl in pnls if pnl > 0]
+    losses = [pnl for pnl in pnls if pnl <= 0]
+
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    net_pnl = sum(pnls)
+
+    trade_count = len(pnls)
+    win_count = len(wins)
+    loss_count = len(losses)
+
+    win_rate = win_count / trade_count if trade_count else 0.0
+    loss_rate = loss_count / trade_count if trade_count else 0.0
+
+    average_win = gross_profit / win_count if win_count else 0.0
+    average_loss = gross_loss / loss_count if loss_count else 0.0
+
+    profit_factor = (
+        gross_profit / gross_loss
+        if gross_loss > 0
+        else None
+    )
+
+    expectancy = (
+        win_rate * average_win
+        - loss_rate * average_loss
+    )
+
+    equity = 0.0
+    equity_peak = 0.0
+    maximum_drawdown_usd = 0.0
+    consecutive_losses = 0
+    maximum_consecutive_losses = 0
+    hold_minutes = []
+
+    for trade, pnl in zip(ordered, pnls):
+        equity += pnl
+        equity_peak = max(equity_peak, equity)
+        maximum_drawdown_usd = max(
+            maximum_drawdown_usd,
+            equity_peak - equity,
+        )
+
+        if pnl <= 0:
+            consecutive_losses += 1
+            maximum_consecutive_losses = max(
+                maximum_consecutive_losses,
+                consecutive_losses,
+            )
+        else:
+            consecutive_losses = 0
+
+        opened_at = trade.get("opened_at")
+        closed_at = trade.get("closed_at")
+        if opened_at and closed_at:
+            hold_minutes.append(
+                max(
+                    0.0,
+                    (closed_at - opened_at).total_seconds() / 60,
+                )
+            )
+
+    return {
+        "trades": trade_count,
+        "wins": win_count,
+        "losses": loss_count,
+        "win_rate_pct": round(win_rate * 100, 2),
+        "net_pnl_usd": round(net_pnl, 2),
+        "gross_profit_usd": round(gross_profit, 2),
+        "gross_loss_usd": round(gross_loss, 2),
+        "profit_factor": (
+            round(profit_factor, 3)
+            if profit_factor is not None
+            else None
+        ),
+        "average_win_usd": round(average_win, 2),
+        "average_loss_usd": round(average_loss, 2),
+        "expectancy_usd": round(expectancy, 3),
+        "maximum_drawdown_usd": round(maximum_drawdown_usd, 2),
+        "maximum_consecutive_losses": maximum_consecutive_losses,
+        "average_hold_minutes": (
+            round(sum(hold_minutes) / len(hold_minutes), 1)
+            if hold_minutes
+            else 0.0
+        ),
+    }
+
+
+@app.get("/api/solbot/analytics")
+async def solbot_analytics(
+    days: int = 7,
+    current_user=Depends(_solbot_require_admin),
+):
+    """
+    Analytics Solbot read-only.
+    Citeste exclusiv solbot_trades; nu modifica documente sau configuratii.
+    """
+    from collections import defaultdict
+    from datetime import datetime, timedelta
+
+    days = max(1, min(days, 365))
+    db = _solbot_db()
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    trades = list(
+        db["solbot_trades"].find({
+            "status": "closed",
+            "paper": True,
+            "excluded_from_analytics": {"$ne": True},
+            "data_valid": {"$ne": False},
+            "closed_at": {"$gte": cutoff},
+        })
+    )
+
+    by_source = defaultdict(list)
+    by_exit_reason = defaultdict(list)
+
+    for trade in trades:
+        source = (
+            trade.get("signal_type")
+            or trade.get("category")
+            or "unknown"
+        )
+        exit_reason = str(
+            trade.get("close_reason") or "unknown"
+        ).split(" (", 1)[0]
+
+        by_source[source].append(trade)
+        by_exit_reason[exit_reason].append(trade)
+
+    return {
+        "period_days": days,
+        "generated_at": datetime.utcnow(),
+        "summary": _solbot_metrics(trades),
+        "by_source": {
+            key: _solbot_metrics(value)
+            for key, value in sorted(by_source.items())
+        },
+        "by_exit_reason": {
+            key: _solbot_metrics(value)
+            for key, value in sorted(by_exit_reason.items())
+        },
+    }
+
+
+@app.get("/api/solbot/config")
+async def solbot_config_get(current_user=Depends(_solbot_require_admin)):
+    return _get_runtime_config()
+
+
+@app.post("/api/solbot/config")
+async def solbot_config_set(updates: dict, current_user=Depends(_solbot_require_admin)):
+    ALLOWED = {"enabled", "capital_usd", "risk_per_trade_pct", "max_concurrent_trades",
+               "stop_loss_pct", "trail_activation_pct", "trail_giveback_pct",
+               "max_hold_minutes", "min_conf_pumpradar", "min_conf_dexscreener_boost",
+               "min_conf_ds_top_boost", "min_conf_ds_profile", "min_helius_wallets"}
+    valid = {k: v for k, v in updates.items() if k in ALLOWED}
+    if not valid:
+        raise HTTPException(status_code=400, detail="No valid keys")
+    db = _solbot_db()
+    from datetime import datetime
+    db["solbot_runtime_config"].update_one(
+        {"_id": "current"},
+        {"$set": {**valid, "updated_at": datetime.utcnow()}},
+        upsert=True,
+    )
+    return _get_runtime_config()
+
+
+
+# === LAUNCH SNIPER DASHBOARD CHAPTER 8 READ-ONLY ===
+@app.get("/api/solbot/launch-sniper/stats")
+async def solbot_launch_sniper_stats(
+    current_user=Depends(_solbot_require_admin),
+):
+    """Dashboard Launch Sniper; nu modifică MongoDB sau serviciile."""
+    del current_user
+    try:
+        try:
+            from backend.solbot_launch_sniper_dashboard_20260728 import (
+                build_dashboard,
+            )
+        except ImportError:
+            from solbot_launch_sniper_dashboard_20260728 import (
+                build_dashboard,
+            )
+
+        return build_dashboard()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Launch Sniper dashboard unavailable",
+        ) from exc
+
+
+@app.get("/api/solbot/launch-sniper/activity")
+async def solbot_launch_sniper_activity(
+    limit: int = 80,
+    current_user=Depends(_solbot_require_admin),
+):
+    """Jurnal read-only pentru serviciile Launch Sniper."""
+    del current_user
+    try:
+        from backend.solbot_launch_sniper_dashboard_20260728 import (
+            read_activity,
+        )
+    except ImportError:
+        from solbot_launch_sniper_dashboard_20260728 import (
+            read_activity,
+        )
+
+    return read_activity(limit)
+
+
+# === END LAUNCH SNIPER DASHBOARD CHAPTER 8 ===
+
+
+@app.get("/api/solbot/insights")
+async def solbot_insights(limit: int = 20, current_user=Depends(_solbot_require_admin)):
+    db = _solbot_db()
+    items = list(db["solbot_ai_insights"].find().sort("at", -1).limit(min(limit, 100)))
+    for it in items:
+        it["_id"] = str(it["_id"])
+        it["trade_id"] = str(it.get("trade_id", ""))
+    return {"insights": items}
+
+
+@app.get("/api/solbot/activity")
+async def solbot_activity(limit: int = 50, current_user=Depends(_solbot_require_admin)):
+    """Returneaza activitatea Solbot direct din systemd journal."""
+    import json
+    import re
+    import subprocess
+    from datetime import datetime, timezone
+
+    units = {
+        "filter": "solbot@filter_worker.service",
+        "ds": "solbot@dexscreener_scanner.service",
+        "prof": "solbot@profiles_scanner.service",
+        "exec": "solbot@executor.service",
+        "onchain": "solbot@onchain_scanner.service",
+    }
+
+    unit_to_source = {
+        unit: source
+        for source, unit in units.items()
+    }
+
+    safe_limit = max(1, min(limit, 100))
+
+    command = ["journalctl"]
+
+    for unit in units.values():
+        command.extend(["-u", unit])
+
+    command.extend([
+        "-n", str(max(250, safe_limit * 10)),
+        "--no-pager",
+        "-o", "json",
+    ])
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        return {"lines": []}
+
+    lines = []
+
+    for raw in result.stdout.splitlines():
+        try:
+            item = json.loads(raw)
+        except Exception:
+            continue
+
+        message = str(item.get("MESSAGE") or "").strip()
+
+        if not message:
+            continue
+
+        unit = str(
+            item.get("_SYSTEMD_UNIT")
+            or item.get("UNIT")
+            or ""
+        )
+
+        source = unit_to_source.get(unit, "solbot")
+
+        try:
+            timestamp_us = int(
+                item.get("__REALTIME_TIMESTAMP") or 0
+            )
+        except Exception:
+            timestamp_us = 0
+
+        if timestamp_us:
+            dt = datetime.fromtimestamp(
+                timestamp_us / 1_000_000,
+                tz=timezone.utc,
+            )
+            time_text = dt.strftime("%H:%M:%S")
+        else:
+            match = re.search(
+                r"\[(\d{2}:\d{2}:\d{2})\]",
+                message,
+            )
+            time_text = (
+                match.group(1)
+                if match
+                else "--:--:--"
+            )
+
+        clean_text = re.sub(
+            r"^\[\d{2}:\d{2}:\d{2}\]\s*",
+            "",
+            message,
+        )
+
+        clean_text = re.sub(
+            r"^\[[^\]]+\]\s*",
+            "",
+            clean_text,
+        )
+
+        lines.append({
+            "time": time_text,
+            "source": source,
+            "text": clean_text,
+            "_timestamp": timestamp_us,
+        })
+
+    lines.sort(
+        key=lambda item: item["_timestamp"],
+        reverse=True,
+    )
+
+    for item in lines:
+        item.pop("_timestamp", None)
+
+    return {"lines": lines[:safe_limit]}
+
+
+@app.get("/api/solbot/is-admin")
+async def solbot_is_admin(current_user=Depends(get_current_user)):
+    return {"is_admin": _is_solbot_admin(current_user)}
+# ============ END SOLBOT ============
+
+
+
+# ============ SIGNAL FRESHNESS ENDPOINT ============
+# Calculeaza pentru un token cat timp a trecut de la peak-ul real
+# vs pretul actual, ca sa marcam semnalele cu badge FRESH/AGED/LATE/DEAD
+
+@app.get("/api/crypto/signal-freshness/{network}/{token_address}")
+async def signal_freshness(network: str, token_address: str):
+    """
+    Returneaza {status, peak_hours_ago, peak_price, current_price, pct_from_peak}
+    status: 'fresh' (<30min de peak), 'aged' (30min-2h), 'late' (2h-6h), 'dead' (>6h sau -20% de peak)
+    Foloseste DexScreener pentru date live (are h1, h6, h24 change).
+    """
+    import requests
+    from datetime import datetime
+
+    network_map = {
+        "solana": "solana",
+        "sol": "solana",
+        "eth": "ethereum",
+        "ethereum": "ethereum",
+        "bsc": "bsc",
+    }
+    ds_chain = network_map.get(network.lower(), network.lower())
+
+    try:
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+            timeout=8,
+        )
+        if r.status_code != 200:
+            return {"status": "unknown", "error": f"dexscreener {r.status_code}"}
+        pairs = r.json().get("pairs") or []
+        pairs = [p for p in pairs if p.get("chainId") == ds_chain]
+        if not pairs:
+            return {"status": "unknown", "error": "no_pairs"}
+        pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd", 0), reverse=True)
+        pair = pairs[0]
+
+        pc = pair.get("priceChange") or {}
+        h1 = float(pc.get("h1") or 0)
+        h6 = float(pc.get("h6") or 0)
+        h24 = float(pc.get("h24") or 0)
+        current_price = float(pair.get("priceUsd") or 0)
+
+        # peak estimation - urcarea maxima cea mai recenta
+        # daca h1 e cel mai mare = pump curent (fresh)
+        # daca h6 > h1 mult = pump acum 2-4h (aged)
+        # daca h24 >> h6 mult = pump acum 12h+ (late/dead)
+
+        max_change = max(h1, h6, h24)
+
+        if max_change < 5:
+            status = "no_pump"
+            peak_hours_ago = None
+            pct_from_peak = 0
+        elif h1 >= max_change * 0.8:
+            # peak in ultima ora
+            status = "fresh" if h1 > 5 else "aged"
+            peak_hours_ago = 0.5
+            pct_from_peak = 0
+        elif h6 >= max_change * 0.7:
+            # peak in ultimele 6h
+            status = "aged" if h6 - h1 < 10 else "late"
+            peak_hours_ago = 3
+            pct_from_peak = round(h1 - h6, 2) if h1 < h6 else 0
+        else:
+            # h24 dominant = peak vechi
+            drop_from_peak = h24 - h1
+            if drop_from_peak > 20:
+                status = "dead"
+            else:
+                status = "late"
+            peak_hours_ago = 12
+            pct_from_peak = round(drop_from_peak, 2)
+
+        return {
+            "status": status,
+            "peak_hours_ago": peak_hours_ago,
+            "current_price": current_price,
+            "price_change_h1": h1,
+            "price_change_h6": h6,
+            "price_change_h24": h24,
+            "pct_from_peak": pct_from_peak,
+            "estimated_peak_change_pct": max_change,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)[:100]}
+
+
+@app.get("/api/crypto/signal-freshness-batch")
+async def signal_freshness_batch(tokens: str = ""):
+    """
+    Batch pentru dashboard. tokens format: 'network1:addr1,network2:addr2,...'
+    Max 30 tokens per call.
+    """
+    if not tokens:
+        return {"results": {}}
+    pairs = tokens.split(",")[:30]
+    results = {}
+    for p in pairs:
+        if ":" not in p:
+            continue
+        network, addr = p.split(":", 1)
+        r = await signal_freshness(network.strip(), addr.strip())
+        results[p] = r
+    return {"results": results}
+# ============ END SIGNAL FRESHNESS ============
+
